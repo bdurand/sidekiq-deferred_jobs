@@ -34,8 +34,6 @@ jobs:
             ruby: "2.6"
           - sidekiq: "5.0"
             ruby: "2.5"
-          - sidekiq: "4.2"
-            ruby: "2.5"
         job: [ rspec ]
         include:
           - job: "standardrb"
