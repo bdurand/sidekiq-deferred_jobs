@@ -1,0 +1,75 @@
+name: Continuous Integration
+on:
+  push:
+    branches:
+      - master
+      - actions-*
+    tags:
+      - v*
+  pull_request:
+env:
+  BUNDLE_CLEAN: "true"
+  BUNDLE_PATH: vendor/bundle
+  BUNDLE_JOBS: 3
+  BUNDLE_RETRY: 3
+jobs:
+  specs:
+    name: ${{ matrix.job }} ruby-${{ matrix.combo.ruby || matrix.ruby }} ${{ matrix.combo.sidekiq && format('sidekiq-{0}', matrix.combo.sidekiq) }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        combo:
+          - sidekiq: "latest"
+            ruby: "3.0"
+          - sidekiq: "6.2"
+            ruby: "2.7"
+          - sidekiq: "6.1"
+            ruby: "2.7"
+          - sidekiq: "6.0"
+            ruby: "2.7"
+          - sidekiq: "5.2"
+            ruby: "2.6"
+          - sidekiq: "5.1"
+            ruby: "2.6"
+          - sidekiq: "5.0"
+            ruby: "2.5"
+          - sidekiq: "4.2"
+            ruby: "2.5"
+        job: [ rspec ]
+        include:
+          - job: "standardrb"
+            ruby: "2.7"
+          - job: "coverage"
+            ruby: "3.0"
+    steps:
+      - name: checkout
+        uses: actions/checkout@v2
+      - name: set up Ruby ${{ matrix.combo.ruby || matrix.ruby }}
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.combo.ruby || matrix.ruby }}
+      - name: setup bundler
+        run: |
+          if [ "${{ matrix.combo.bundler }}" != "" ]; then
+            gem uninstall bundler --all
+            gem install bundler --no-document --version ${{ matrix.combo.bundler }}
+          fi
+          if [ "${{ matrix.combo.sidekiq }}" != "" ] && [ "${{ matrix.combo.sidekiq }}" != "latest" ]; then
+            echo "using gemfile gemfiles/sidekiq$-{{ matrix.combo.sidekiq }}.gemfile"
+            bundle config set gemfile "gemfiles/sidekiq-${{ matrix.combo.activesupport }}.gemfile"
+          fi
+          bundle update
+      - name: specs
+        if:   matrix.job == 'rspec'
+        run:  bundle exec rake spec
+      - name: code coverage
+        if:   matrix.job == 'coverage'
+        uses: paambaati/codeclimate-action@v2.7.5
+        env:
+          CC_TEST_REPORTER_ID: 2c2a54a4f76a2ac5c3c8b6e26af2582d1cac4a99bf012356d5e7776188977192
+        with:
+          coverageCommand: bundle exec rake spec
+      - name: standardrb
+        if:   matrix.job == 'standardrb'
+        run:  bundle exec rake standard
