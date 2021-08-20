@@ -56,8 +56,8 @@ jobs:
             gem install bundler --no-document --version ${{ matrix.combo.bundler }}
           fi
           if [ "${{ matrix.combo.sidekiq }}" != "" ] && [ "${{ matrix.combo.sidekiq }}" != "latest" ]; then
-            echo "using gemfile gemfiles/sidekiq$-{{ matrix.combo.sidekiq }}.gemfile"
-            bundle config set gemfile "gemfiles/sidekiq-${{ matrix.combo.sidekiq }}.gemfile"
+            echo "using gemfile gemfiles/sidekiq$_{{ matrix.combo.sidekiq }}.gemfile"
+            bundle config set gemfile "gemfiles/sidekiq_${{ matrix.combo.sidekiq }}.gemfile"
           fi
           bundle update
       - name: specs
@@ -67,7 +67,7 @@ jobs:
         if:   matrix.job == 'coverage'
         uses: paambaati/codeclimate-action@v2.7.5
         env:
-          CC_TEST_REPORTER_ID: 2c2a54a4f76a2ac5c3c8b6e26af2582d1cac4a99bf012356d5e7776188977192
+          CC_TEST_REPORTER_ID: 5a05583e3035b426c444a47f96562b42bfff00a8a6630c0d7257f141f3b24a9d
         with:
           coverageCommand: bundle exec rake spec
       - name: standardrb
