@@ -2,7 +2,7 @@
 
 require_relative "../spec_helper"
 
-describe Sidekiq::DeferredWorkers do
+describe Sidekiq::DeferredJobs do
   describe "Sidekiq.defer_jobs" do
     it "should do nothing outside of a Sidekiq.defer_jobs block" do
       TestWorker.perform_async("foobar", 1)
@@ -51,6 +51,16 @@ describe Sidekiq::DeferredWorkers do
       end
       expect(TestWorker.jobs.collect { |job| job["args"] }).to eq [[1]]
       expect(TestWorker.jobs.collect { |job| job["foo"] }).to eq ["bazzle"]
+    end
+
+    it "should not impact scheduled jobs" do
+      Sidekiq.defer_jobs do
+        TestWorker.perform_in(60, 1)
+        expect(TestWorker.jobs.size).to eq 1
+        expect(TestWorker.jobs.collect { |job| job["args"] }).to eq [[1]]
+      end
+      expect(TestWorker.jobs.size).to eq 1
+      expect(TestWorker.jobs.collect { |job| job["args"] }).to eq [[1]]
     end
   end
 

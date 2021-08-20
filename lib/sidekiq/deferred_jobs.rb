@@ -3,8 +3,7 @@
 require "sidekiq"
 
 module Sidekiq
-  module DeferredWorkers
-
+  module DeferredJobs
     class << self
       def defer(filter)
         jobs, filters = Thread.current[:sidekiq_deferred_jobs_jobs]
@@ -54,9 +53,9 @@ module Sidekiq
     module DeferBlock
       def defer_jobs(*filter, &block)
         if filter.size == 1 && filter.first == false
-          Sidekiq::DeferredWorkers.undeferred(&block)
+          Sidekiq::DeferredJobs.undeferred(&block)
         else
-          Sidekiq::DeferredWorkers.defer(filter, &block)
+          Sidekiq::DeferredJobs.defer(filter, &block)
         end
       end
 
@@ -71,7 +70,7 @@ module Sidekiq
       def enqueue_deferred_jobs!(*filter)
         jobs, _filters = Thread.current[:sidekiq_deferred_jobs_jobs]
         if jobs
-          Sidekiq::DeferredWorkers.undeferred { jobs.enqueue!(filter) }
+          Sidekiq::DeferredJobs.undeferred { jobs.enqueue!(filter) }
         end
         nil
       end
@@ -79,8 +78,8 @@ module Sidekiq
 
     module DeferredWorker
       def perform_async(*args)
-        if Sidekiq::DeferredWorkers.defer?(self)
-          Sidekiq::DeferredWorkers.defer_worker(self, args)
+        if Sidekiq::DeferredJobs.defer?(self)
+          Sidekiq::DeferredJobs.defer_worker(self, args)
         else
           super
         end
@@ -89,8 +88,8 @@ module Sidekiq
 
     module DeferredSetter
       def perform_async(*args)
-        if Sidekiq::DeferredWorkers.defer?(@klass, @opts)
-          Sidekiq::DeferredWorkers.defer_worker(@klass, args, @opts)
+        if Sidekiq::DeferredJobs.defer?(@klass, @opts)
+          Sidekiq::DeferredJobs.defer_worker(@klass, args, @opts)
         else
           super
         end
@@ -179,6 +178,6 @@ module Sidekiq
   end
 end
 
-Sidekiq.extend(Sidekiq::DeferredWorkers::DeferBlock)
-Sidekiq::Worker::ClassMethods.prepend(Sidekiq::DeferredWorkers::DeferredWorker)
-Sidekiq::Worker::Setter.prepend(Sidekiq::DeferredWorkers::DeferredSetter)
+Sidekiq.extend(Sidekiq::DeferredJobs::DeferBlock)
+Sidekiq::Worker::ClassMethods.prepend(Sidekiq::DeferredJobs::DeferredWorker)
+Sidekiq::Worker::Setter.prepend(Sidekiq::DeferredJobs::DeferredSetter)
