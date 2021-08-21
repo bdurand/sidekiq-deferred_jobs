@@ -208,9 +208,12 @@ module Sidekiq
 
       # @return [Boolean] true if the worker support a uniqueness constraint
       def unique_job?(klass, opts)
-        if defined?(Sidekiq::Enterprise) && worker_options(klass, opts)["unique_for"]
+        enterprise_option = worker_options(klass, opts)["unique_for"] if defined?(Sidekiq::Enterprise)
+        unique_jobs_option = worker_options(klass, opts)["lock"] if defined?(SidekiqUniqueJobs)
+
+        if enterprise_option
           true
-        elsif defined?(SidekiqUniqueJobs) && worker_options(klass, opts)["lock"]
+        elsif unique_jobs_option && unique_jobs_option.to_s != "while_executing"
           true
         else
           false

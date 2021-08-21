@@ -62,6 +62,17 @@ describe Sidekiq::DeferredJobs do
       expect(TestWorker.jobs.size).to eq 1
       expect(TestWorker.jobs.collect { |job| job["args"] }).to eq [[1]]
     end
+
+    it "should still enqueue jobs before an error" do
+      expect do
+        Sidekiq.defer_jobs do
+          TestWorker.perform_async(1)
+          raise "Boom!"
+          TestWorker.perform_async(2)
+        end
+      end.to raise_error("Boom!")
+      expect(TestWorker.jobs.collect { |job| job["args"] }).to eq [[1]]
+    end
   end
 
   describe "Sidekiq.abort_deferred_jobs!" do
@@ -259,6 +270,17 @@ describe Sidekiq::DeferredJobs do
         UniqueJobsWorker.perform_async(3)
       end
       expect(UniqueJobsWorker.jobs.collect { |job| job["args"] }).to eq [[1], [2], [3]]
+    end
+
+    it "should not suppress sidekiq-unique-jobs duplicate jobs only locked while executing" do
+      stub_const("SidekiqUniqueJobs", Module.new)
+      Sidekiq.defer_jobs do
+        UniqueJobsWorker.set(lock: "while_executing").perform_async(1)
+        UniqueJobsWorker.set(lock: "while_executing").perform_async(2)
+        UniqueJobsWorker.set(lock: "while_executing").perform_async(1)
+        UniqueJobsWorker.set(lock: "while_executing").perform_async(3)
+      end
+      expect(UniqueJobsWorker.jobs.collect { |job| job["args"] }).to eq [[1], [2], [1], [3]]
     end
 
     it "should suppress sidekiq enterprise duplicate jobs" do
