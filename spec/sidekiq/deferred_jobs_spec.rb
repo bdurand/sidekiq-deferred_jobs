@@ -68,7 +68,9 @@ describe Sidekiq::DeferredJobs do
         Sidekiq.defer_jobs do
           TestWorker.perform_async(1)
           raise "Boom!"
+          # rubocop:disable Lint/UnreachableCode
           TestWorker.perform_async(2)
+          # rubocop:enable Lint/UnreachableCode
         end
       end.to raise_error("Boom!")
       expect(TestWorker.jobs.collect { |job| job["args"] }).to eq [[1]]

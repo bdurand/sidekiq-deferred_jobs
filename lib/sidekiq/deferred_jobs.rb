@@ -213,8 +213,8 @@ module Sidekiq
 
         if enterprise_option
           true
-        elsif unique_jobs_option && unique_jobs_option.to_s != "while_executing"
-          true
+        elsif unique_jobs_option
+          unique_jobs_option.to_s != "while_executing"
         else
           false
         end
