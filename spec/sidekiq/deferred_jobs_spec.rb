@@ -80,15 +80,17 @@ describe Sidekiq::DeferredJobs do
   describe "Sidekiq.abort_deferred_jobs!" do
     it "should do nothing outside of a defer block" do
       TestWorker.perform_async("foobar", 1)
-      Sidekiq.abort_deferred_jobs!
+      aborted_jobs = Sidekiq.abort_deferred_jobs!
       expect(TestWorker.jobs.collect { |job| job["args"] }).to eq [["foobar", 1]]
+      expect(aborted_jobs).to eq []
     end
 
     it "should abort all currently deferred jobs" do
       Sidekiq.defer_jobs do
         TestWorker.perform_async(1)
         TestWorker.perform_async(2)
-        Sidekiq.abort_deferred_jobs!
+        aborted_jobs = Sidekiq.abort_deferred_jobs!
+        expect(aborted_jobs.size).to eq 2
         expect(TestWorker.jobs.size).to eq 0
         TestWorker.perform_async(3)
         expect(TestWorker.jobs.size).to eq 0
@@ -101,7 +103,8 @@ describe Sidekiq::DeferredJobs do
         TestWorker.perform_async(1)
         UniqueWorker.perform_async(2)
         UniqueJobsWorker.perform_async(3)
-        Sidekiq.abort_deferred_jobs!(TestWorker)
+        aborted_jobs = Sidekiq.abort_deferred_jobs!(TestWorker)
+        expect(aborted_jobs.size).to eq 1
         expect(TestWorker.jobs.size).to eq 0
         expect(UniqueWorker.jobs.size).to eq 0
         expect(UniqueJobsWorker.jobs.size).to eq 0

@@ -90,13 +90,14 @@ module Sidekiq
       # Abort any already deferred Sidkiq workers in the current `defer_job` block.
       # If a filter is specified, then only matching Sidekiq jobs will be aborted.
       # @param *filter See #defer_job for filter specification.
-      # @return [void]
+      # @return [Array<Sidekiq::DeferredJobs::Job>] the jobs that were aborted
       def abort_deferred_jobs!(*filter)
         jobs, _filters = Thread.current[:sidekiq_deferred_jobs_jobs]
         if jobs
           jobs.clear!(filter)
+        else
+          []
         end
-        nil
       end
 
       # Immediately enqueue any already deferred Sidkiq workers in the current `defer_job` block.
@@ -156,6 +157,9 @@ module Sidekiq
       end
     end
 
+    # Data structure to hold job information.
+    Job = Struct.new(:klass, :args, :opts)
+
     # Class for holding deferred jobs.
     class Jobs
       def initialize
@@ -167,14 +171,16 @@ module Sidekiq
       # @param args [Array] Sidekiq job arguments
       # @param opts [Hash, Nil] optional runtime jobs options
       def defer(klass, args, opts = nil)
-        @jobs << [klass, args, opts]
+        @jobs << Job.new(klass, args&.dup, opts&.dup)
       end
 
       # Clear any deferred jobs that match the filter.
       # @filter [Array<Module>, Array<Hash>] Filter for jobs to clear
       def clear!(filters = nil)
         filter = Filter.new(filters)
-        @jobs = @jobs.reject { |klass, _args, opts| filter.match?(klass, opts) }
+        cleared_jobs = @jobs.select { |job| filter.match?(job.klass, job.opts) }
+        @jobs -= cleared_jobs
+        cleared_jobs
       end
 
       # Enqueue any deferred jobs that match the filter.
@@ -184,19 +190,19 @@ module Sidekiq
         remaining_jobs = []
         begin
           duplicates = Set.new
-          @jobs.each do |klass, args, opts|
-            if filter.match?(klass, opts)
-              if unique_job?(klass, opts)
-                next if duplicates.include?([klass, args])
-                duplicates << [klass, args]
+          @jobs.each do |job|
+            if filter.match?(job.klass, job.opts)
+              if unique_job?(job.klass, job.opts)
+                next if duplicates.include?([job.klass, job.args])
+                duplicates << [job.klass, job.args]
               end
-              if opts
-                klass.set(opts).perform_async(*args)
+              if job.opts
+                job.klass.set(job.opts).perform_async(*job.args)
               else
-                klass.perform_async(*args)
+                job.klass.perform_async(*job.args)
               end
             else
-              remaining_jobs << [klass, args, opts]
+              remaining_jobs << job
             end
           end
         ensure

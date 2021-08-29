@@ -33,25 +33,40 @@ Sidekiq.defer_jobs do
     # SomeWorker jobs will not be enqueued here
   end
 end
-# Only once we get here will the jobs be enqueued
+# All the jobs are now enqueued
 ```
 
-The workers are fired in an `ensure` block, so even if an error is raised in the `defered_jobs` block, any jobs that would have been enqueued prior to the error will still be enqueued.
+The workers are fired in an `ensure` block, so even if an error is raised, any jobs that would have been enqueued prior to the error will still be enqueued.
 
 You can also pass a filter to `defer_jobs` to filter either by class or by `sidekiq_options`.
 
 ```ruby
+class SomeWorker
+  include Sidekiq::Worker
+  sidekiq_options priority: "high"
+end
+
+class OtherWorker
+  include Sidekiq::Worker
+end
+
 Sidekiq.defer_jobs(SomeWorker) do
   SomeWorker.perform_async(1)
   # The SomeWorker job will not be enqueued yet
 
   OtherWorker.perform_async(2)
-  # The OtherWorker job will be enqueued since it doesn't match the filter
+  # The OtherWorker job will be enqueued here since it doesn't match the filter
 end
+# The SomeWorker job will now be enqueued
 
 Sidekiq.defer_jobs(priority: "high") do
-  # Only workers with `sidekiq_options priority: "high"` will be deferred
+  SomeWorker.perform_async(3)
+  # The SomeWorker job will not be enqueued yet
+
+  OtherWorker.perform_async(4)
+  # The OtherWorker job will be enqueued here since it doesn't match the filter
 end
+# The SomeWorker job will now be enqueued
 ```
 
 You can also pass `false` to `Sidekiq.defer_jobs` turn off deferral entirely within a block.
@@ -63,7 +78,7 @@ Sidekiq.defer_jobs(false) do
 end
 ```
 
-You can also manually control over when deferred jobs are enqueued or even need to remove previously deferred jobs.
+You can also manually control over when deferred jobs are enqueued or even remove previously deferred jobs.
 
 ```ruby
 Sidekiq.defer_jobs do
