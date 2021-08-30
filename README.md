@@ -50,6 +50,7 @@ class OtherWorker
   include Sidekiq::Worker
 end
 
+# Filter by worker class
 Sidekiq.defer_jobs(SomeWorker) do
   SomeWorker.perform_async(1)
   # The SomeWorker job will not be enqueued yet
@@ -59,6 +60,7 @@ Sidekiq.defer_jobs(SomeWorker) do
 end
 # The SomeWorker job will now be enqueued
 
+# Filter by sidekiq_options
 Sidekiq.defer_jobs(priority: "high") do
   SomeWorker.perform_async(3)
   # The SomeWorker job will not be enqueued yet
