@@ -21,11 +21,11 @@ jobs:
       matrix:
         combo:
           - sidekiq: "latest"
-            ruby: "3.0"
+            ruby: "3"
           - sidekiq: "6.2"
-            ruby: "2.7"
+            ruby: "3.0"
           - sidekiq: "6.1"
-            ruby: "2.7"
+            ruby: "3.0"
           - sidekiq: "6.0"
             ruby: "2.7"
           - sidekiq: "5.2"
