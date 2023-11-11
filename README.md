@@ -1,6 +1,5 @@
 [![Continuous Integration](https://github.com/bdurand/sidekiq-deferred_jobs/actions/workflows/continuous_integration.yml/badge.svg)](https://github.com/bdurand/sidekiq-deferred_jobs/actions/workflows/continuous_integration.yml)
-[![Maintainability](https://api.codeclimate.com/v1/badges/3f5fb49ca1d03f698d5b/maintainability)](https://codeclimate.com/github/bdurand/sidekiq-deferred_jobs/maintainability)
-[![Test Coverage](https://api.codeclimate.com/v1/badges/3f5fb49ca1d03f698d5b/test_coverage)](https://codeclimate.com/github/bdurand/sidekiq-deferred_jobs/test_coverage)
+[![Regression Test](https://github.com/bdurand/sidekiq-deferred_jobs/actions/workflows/regression_test.yml/badge.svg)](https://github.com/bdurand/sidekiq-deferred_jobs/actions/workflows/regression_test.yml)
 [![Ruby Style Guide](https://img.shields.io/badge/code_style-standard-brightgreen.svg)](https://github.com/testdouble/standard)
 
 # Sidekiq Deferred Jobs
