@@ -1,4 +1,5 @@
 name: Continuous Integration
+
 on:
   push:
     branches:
@@ -7,67 +8,59 @@ on:
     tags:
       - v*
   pull_request:
+    branches-ignore:
+      - actions-*
+
 env:
   BUNDLE_CLEAN: "true"
   BUNDLE_PATH: vendor/bundle
   BUNDLE_JOBS: 3
   BUNDLE_RETRY: 3
+
 jobs:
-  specs:
-    name: ${{ matrix.job }} ruby-${{ matrix.combo.ruby || matrix.ruby }} ${{ matrix.combo.sidekiq && format('sidekiq-{0}', matrix.combo.sidekiq) }}
+  build:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        combo:
-          - sidekiq: "latest"
-            ruby: "3"
-          - sidekiq: "6.2"
-            ruby: "3.0"
-          - sidekiq: "6.1"
-            ruby: "3.0"
-          - sidekiq: "6.0"
-            ruby: "2.7"
-          - sidekiq: "5.2"
-            ruby: "2.6"
-          - sidekiq: "5.1"
-            ruby: "2.6"
-          - sidekiq: "5.0"
-            ruby: "2.5"
-        job: [ rspec ]
         include:
-          - job: "standardrb"
-            ruby: "2.7"
-          - job: "coverage"
-            ruby: "3.0"
+          - ruby: "ruby"
+            standardrb: true
+          - ruby: "3.1"
+            appraisal: "sidekiq_7.0"
+          - ruby: "3.0"
+            appraisal: "sidekiq_6.5"
+          - ruby: "2.7"
+            appraisal: "sidekiq_6.0"
+          - ruby: "2.6"
+            appraisal: "sidekiq_5.2"
+          - ruby: "2.5"
+            appraisal: "sidekiq_5.0"
     steps:
-      - name: checkout
-        uses: actions/checkout@v2
-      - name: set up Ruby ${{ matrix.combo.ruby || matrix.ruby }}
-        uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: ${{ matrix.combo.ruby || matrix.ruby }}
-      - name: setup bundler
-        run: |
-          if [ "${{ matrix.combo.bundler }}" != "" ]; then
-            gem uninstall bundler --all
-            gem install bundler --no-document --version ${{ matrix.combo.bundler }}
-          fi
-          if [ "${{ matrix.combo.sidekiq }}" != "" ] && [ "${{ matrix.combo.sidekiq }}" != "latest" ]; then
-            echo "using gemfile gemfiles/sidekiq_${{ matrix.combo.sidekiq }}.gemfile"
-            bundle config set gemfile "gemfiles/sidekiq_${{ matrix.combo.sidekiq }}.gemfile"
-          fi
-          bundle update
-      - name: specs
-        if:   matrix.job == 'rspec'
-        run:  bundle exec rake spec
-      - name: code coverage
-        if:   matrix.job == 'coverage'
-        uses: paambaati/codeclimate-action@v2.7.5
-        env:
-          CC_TEST_REPORTER_ID: 5a05583e3035b426c444a47f96562b42bfff00a8a6630c0d7257f141f3b24a9d
-        with:
-          coverageCommand: bundle exec rake spec
-      - name: standardrb
-        if:   matrix.job == 'standardrb'
-        run:  bundle exec rake standard
+    - uses: actions/checkout@v4
+    - name: Set up Ruby ${{ matrix.ruby }}
+      uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: "${{ matrix.ruby }}"
+    - name: Install packages
+      run: |
+        sudo apt-get update
+        sudo apt-get install libsqlite3-dev
+    - name: Setup bundler
+      if: matrix.bundler != ''
+      run: |
+        gem uninstall bundler --all
+        gem install bundler --no-document --version ${{ matrix.bundler }}
+    - name: Set Appraisal bundle
+      if: matrix.appraisal != ''
+      run: |
+        echo "using gemfile gemfiles/${{ matrix.appraisal }}.gemfile"
+        bundle config set gemfile "gemfiles/${{ matrix.appraisal }}.gemfile"
+    - name: Install gems
+      run: |
+        bundle update
+    - name: Run Tests
+      run: bundle exec rake
+    - name: standardrb
+      if:   matrix.standardrb == true
+      run:  bundle exec rake standard
