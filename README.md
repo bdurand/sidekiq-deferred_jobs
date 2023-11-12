@@ -1,8 +1,9 @@
+# Sidekiq Deferred Jobs
+
 [![Continuous Integration](https://github.com/bdurand/sidekiq-deferred_jobs/actions/workflows/continuous_integration.yml/badge.svg)](https://github.com/bdurand/sidekiq-deferred_jobs/actions/workflows/continuous_integration.yml)
 [![Regression Test](https://github.com/bdurand/sidekiq-deferred_jobs/actions/workflows/regression_test.yml/badge.svg)](https://github.com/bdurand/sidekiq-deferred_jobs/actions/workflows/regression_test.yml)
 [![Ruby Style Guide](https://img.shields.io/badge/code_style-standard-brightgreen.svg)](https://github.com/testdouble/standard)
-
-# Sidekiq Deferred Jobs
+[![Gem Version](https://badge.fury.io/rb/sidekiq-deferred_jobs.svg)](https://badge.fury.io/rb/sidekiq-deferred_jobs)
 
 This gem provides an enhancement to [Sidekiq](https://github.com/mperham/sidekiq) to defer enqueuing jobs until the end of a block of code. This is useful in situations where you need to better coordinate when jobs are enqueued to guard against race conditions or deduplicate jobs. In most cases, this provides no functional difference to your code; it just delays slightly when jobs are enqueued.
 
