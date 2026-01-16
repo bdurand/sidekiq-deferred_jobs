@@ -1,0 +1,5 @@
+--no-private
+lib/**/*.rb
+- MIT-LICENSE.txt
+- CHANGELOG.md
+--exclude lib/sidekiq/deferred_jobs_ext.rb
