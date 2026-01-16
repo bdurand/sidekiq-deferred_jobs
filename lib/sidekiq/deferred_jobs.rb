@@ -8,6 +8,7 @@ module Sidekiq
       # Defer enqueuing Sidekiq workers within the block until the end of the block.
       # Any workers that normally would have been enqueued with a `perform_async` call
       # will instead be queued up and run in an ensure clause at the end of the block.
+      #
       # @param filter [Array<Module>, Array<Hash>] An array of either classes, modules, or hashes.
       #        If this is provided, only workers that match either a class or module or which have
       #        sidekiq_options that match a hash will be deferred. All other worker will be enqueued as normal.
@@ -33,6 +34,7 @@ module Sidekiq
 
       # Disable deferred workers within the block. All workers will be enqueued normally
       # within the block.
+      #
       # @return [void]
       def undeferred(&block)
         save_val = Thread.current[:sidekiq_deferred_jobs_jobs]
@@ -45,6 +47,7 @@ module Sidekiq
       end
 
       # Return true if the specified class with optional options should be deferred.
+      #
       # @param klass [Class] A Sidekiq worker class
       # @param opts [Hash, Nil] Optionsl options set at runtime for the worker.
       # @return Boolean
@@ -55,6 +58,7 @@ module Sidekiq
       end
 
       # Schedule a worker to be run at the end of the outermost defer block.
+      #
       # @param klass [Class] Sidekiq worker class
       # @param args [Array] Sidekiq job arguments
       # @param opts [Hash, Nil] Optional sidekiq options specified for the job
@@ -73,7 +77,8 @@ module Sidekiq
       # Defer enqueuing Sidekiq workers within the block until the end of the block.
       # Any workers that normally would have been enqueued with a `perform_async` call
       # will instead be queued up and run in an ensure clause at the end of the block.
-      # @param *filter [Module>, Hash, FalseClass] Optional filter on which workers should be deferred.
+      #
+      # @param filter [Array<Module>, Hash, false] Optional filter on which workers should be deferred.
       #                If a filter is specified, only matching workers will be deferred. To match the
       #                filter, the worker must either be the class specfied or include the module or
       #                have sidekiq_options that match the specified hash. If the filter is `false`
@@ -89,7 +94,8 @@ module Sidekiq
 
       # Abort any already deferred Sidkiq workers in the current `defer_job` block.
       # If a filter is specified, then only matching Sidekiq jobs will be aborted.
-      # @param *filter See #defer_job for filter specification.
+      #
+      # @param filter [Array<Module>, Hash, false] See #defer_job for filter specification.
       # @return [Array<Sidekiq::DeferredJobs::Job>] the jobs that were aborted
       def abort_deferred_jobs!(*filter)
         jobs, _filters = Thread.current[:sidekiq_deferred_jobs_jobs]
@@ -102,7 +108,8 @@ module Sidekiq
 
       # Immediately enqueue any already deferred Sidkiq workers in the current `defer_job` block.
       # If a filter is specified, then only matching Sidekiq jobs will be enqueued.
-      # @param *filter See #defer_job for filter specification.
+      #
+      # @param filter [Array<Module>, Hash, false] See #defer_job for filter specification.
       # @return [void]
       def enqueue_deferred_jobs!(*filter)
         jobs, _filters = Thread.current[:sidekiq_deferred_jobs_jobs]
@@ -167,15 +174,19 @@ module Sidekiq
       end
 
       # Add a job to the deferred job list.
+      #
       # @param klass [Class] Sidekiq worker class.
       # @param args [Array] Sidekiq job arguments
       # @param opts [Hash, Nil] optional runtime jobs options
+      # @return [void]
       def defer(klass, args, opts = nil)
         @jobs << Job.new(klass, args&.dup, opts&.dup)
       end
 
       # Clear any deferred jobs that match the filter.
-      # @filter [Array<Module>, Array<Hash>] Filter for jobs to clear
+      #
+      # @param filters [Array<Module>, Array<Hash>] Filter for jobs to clear
+      # @return [Array<Sidekiq::DeferredJobs::Job>] the jobs that were cleared
       def clear!(filters = nil)
         filter = Filter.new(filters)
         cleared_jobs = @jobs.select { |job| filter.match?(job.klass, job.opts) }
@@ -184,7 +195,9 @@ module Sidekiq
       end
 
       # Enqueue any deferred jobs that match the filter.
-      # @filter [Array<Module>, Array<Hash>] Filter for jobs to clear
+      #
+      # @param filters [Array<Module>, Array<Hash>] Filter for jobs to clear
+      # @return [void]
       def enqueue!(filters = nil)
         filter = Filter.new(filters)
         remaining_jobs = []
@@ -238,6 +251,4 @@ module Sidekiq
   end
 end
 
-Sidekiq.extend(Sidekiq::DeferredJobs::DeferBlock)
-Sidekiq::Worker::ClassMethods.prepend(Sidekiq::DeferredJobs::DeferredWorker)
-Sidekiq::Worker::Setter.prepend(Sidekiq::DeferredJobs::DeferredSetter)
+require_relative "deferred_jobs_ext"
