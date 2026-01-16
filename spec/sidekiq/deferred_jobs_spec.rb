@@ -2,7 +2,7 @@
 
 require_relative "../spec_helper"
 
-describe Sidekiq::DeferredJobs do
+RSpec.describe Sidekiq::DeferredJobs do
   describe "Sidekiq.defer_jobs" do
     it "should do nothing outside of a Sidekiq.defer_jobs block" do
       TestWorker.perform_async("foobar", 1)

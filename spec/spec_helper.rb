@@ -19,8 +19,10 @@ require_relative "../lib/sidekiq-deferred_jobs"
 require "sidekiq/testing"
 
 RSpec.configure do |config|
-  config.warnings = true
+  config.disable_monkey_patching!
+  config.default_formatter = "doc" if config.files_to_run.one? || ENV["RSPEC_FORMATTER"] == "doc"
   config.order = :random
+  Kernel.srand config.seed
 
   config.before :each do
     Sidekiq::Queues.clear_all
@@ -31,7 +33,7 @@ module TestModule
 end
 
 class TestWorker
-  include Sidekiq::Worker
+  include(defined?(Sidekiq::Job) ? Sidekiq::Job : Sidekiq::Worker)
   include TestModule
 
   sidekiq_options queue: "high", foo: "bar"
@@ -41,7 +43,7 @@ class TestWorker
 end
 
 class UniqueWorker
-  include Sidekiq::Worker
+  include(defined?(Sidekiq::Job) ? Sidekiq::Job : Sidekiq::Worker)
 
   sidekiq_options unique_for: 60, queue: "low"
 
@@ -50,7 +52,7 @@ class UniqueWorker
 end
 
 class UniqueJobsWorker
-  include Sidekiq::Worker
+  include(defined?(Sidekiq::Job) ? Sidekiq::Job : Sidekiq::Worker)
 
   sidekiq_options lock: :until_executing, queue: "high"
 
