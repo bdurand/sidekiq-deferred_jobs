@@ -63,6 +63,22 @@ RSpec.describe Sidekiq::DeferredJobs do
       expect(TestWorker.jobs.collect { |job| job["args"] }).to eq [[1]]
     end
 
+    it "should not impact scheduled jobs enqueued through a Setter" do
+      Sidekiq.defer_jobs do
+        TestWorker.set(queue: "low").perform_in(60, 1)
+        TestWorker.set("at" => Time.now.to_f + 60).perform_async(2)
+        expect(TestWorker.jobs.collect { |job| job["args"] }).to eq [[1], [2]]
+      end
+      expect(TestWorker.jobs.size).to eq 2
+    end
+
+    it "should raise an ArgumentError on invalid filters" do
+      expect { Sidekiq.defer_jobs("high") { TestWorker.perform_async(1) } }.to raise_error(ArgumentError)
+      expect(TestWorker.jobs.size).to eq 0
+      TestWorker.perform_async(2)
+      expect(TestWorker.jobs.collect { |job| job["args"] }).to eq [[2]]
+    end
+
     it "should still enqueue jobs before an error" do
       expect do
         Sidekiq.defer_jobs do
@@ -133,6 +149,26 @@ RSpec.describe Sidekiq::DeferredJobs do
         expect(TestWorker.jobs.size).to eq 0
       end
       expect(TestWorker.jobs.collect { |job| job["args"] }).to eq [[3]]
+    end
+
+    it "should retain jobs that could not be enqueued when an error is raised" do
+      Sidekiq.defer_jobs do
+        TestWorker.perform_async(1)
+        UniqueWorker.perform_async(2)
+        TestWorker.perform_async(3)
+
+        allow(UniqueWorker).to receive(:client_push).and_raise("Boom!")
+        expect { Sidekiq.enqueue_deferred_jobs! }.to raise_error("Boom!")
+        expect(TestWorker.jobs.collect { |job| job["args"] }).to eq [[1]]
+        expect(UniqueWorker.jobs.size).to eq 0
+
+        allow(UniqueWorker).to receive(:client_push).and_call_original
+        Sidekiq.enqueue_deferred_jobs!
+        expect(TestWorker.jobs.collect { |job| job["args"] }).to eq [[1], [3]]
+        expect(UniqueWorker.jobs.size).to eq 1
+      end
+      expect(TestWorker.jobs.size).to eq 2
+      expect(UniqueWorker.jobs.size).to eq 1
     end
 
     it "should filter jobs to immediately enqueue" do
@@ -297,6 +333,15 @@ RSpec.describe Sidekiq::DeferredJobs do
         UniqueWorker.perform_async(3)
       end
       expect(UniqueWorker.jobs.collect { |job| job["args"] }).to eq [[1], [2], [3]]
+    end
+
+    it "should not suppress duplicate unique jobs enqueued to different queues" do
+      stub_const("SidekiqUniqueJobs", Module.new)
+      Sidekiq.defer_jobs do
+        UniqueJobsWorker.set(queue: "queue_1").perform_async(1)
+        UniqueJobsWorker.set(queue: "queue_2").perform_async(1)
+      end
+      expect(UniqueJobsWorker.jobs.size).to eq 2
     end
 
     it "should work with settings" do

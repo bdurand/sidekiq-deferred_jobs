@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "set"
 require "sidekiq"
 
 module Sidekiq
@@ -14,13 +15,14 @@ module Sidekiq
       #        sidekiq_options that match a hash will be deferred. All other worker will be enqueued as normal.
       # @return [void]
       def defer(filter, &block)
+        new_filter = Filter.new(filter)
         jobs, filters = Thread.current[:sidekiq_deferred_jobs_jobs]
         unless jobs
           filters = []
           jobs = Jobs.new
           Thread.current[:sidekiq_deferred_jobs_jobs] = [jobs, filters]
         end
-        filters.push(Filter.new(filter))
+        filters.push(new_filter)
         begin
           yield
         ensure
@@ -67,9 +69,22 @@ module Sidekiq
         jobs, _filters = Thread.current[:sidekiq_deferred_jobs_jobs]
         if jobs
           jobs.defer(klass, args, opts)
+        elsif opts
+          klass.set(opts).perform_async(*args)
         else
           klass.perform_async(*args)
         end
+      end
+
+      # Return true if the options indicate a job scheduled to run in the future.
+      # Scheduled jobs are never deferred since they are not enqueued immediately anyway.
+      #
+      # @param opts [Hash, Nil] Runtime options set for a job.
+      # @return [Boolean]
+      # @api private
+      def scheduled_opts?(opts)
+        return false unless opts
+        !!(opts["at"] || opts[:at])
       end
     end
 
@@ -134,7 +149,7 @@ module Sidekiq
     # Override logic for Sidekiq::Worker::Setter.
     module DeferredSetter
       def perform_async(*args)
-        if Sidekiq::DeferredJobs.defer?(@klass, @opts)
+        if !Sidekiq::DeferredJobs.scheduled_opts?(@opts) && Sidekiq::DeferredJobs.defer?(@klass, @opts)
           Sidekiq::DeferredJobs.defer_worker(@klass, args, @opts)
         else
           super
@@ -146,6 +161,10 @@ module Sidekiq
     class Filter
       def initialize(filters)
         @filters = Array(filters).flatten
+        invalid = @filters.reject { |filter| filter.is_a?(Module) || filter.is_a?(Hash) }
+        unless invalid.empty?
+          raise ArgumentError, "Filters must be classes, modules, or hashes; got #{invalid.collect(&:inspect).join(", ")}"
+        end
       end
 
       # @return [Boolean] true if the job matches the filters.
@@ -154,11 +173,9 @@ module Sidekiq
         @filters.any? do |filter|
           if filter.is_a?(Module)
             klass <= filter
-          elsif filter.is_a?(Hash)
+          else
             worker_options = (opts ? klass.sidekiq_options.merge(opts.transform_keys(&:to_s)) : klass.sidekiq_options)
             filter.all? { |key, value| worker_options[key.to_s] == value }
-          else
-            filter
           end
         end
       end
@@ -196,30 +213,41 @@ module Sidekiq
 
       # Enqueue any deferred jobs that match the filter.
       #
+      # If enqueuing a job raises an error, the error will be propagated to the caller
+      # and any jobs that have not yet been enqueued will be retained in the deferred
+      # job list so they are not silently lost and can be enqueued again.
+      #
       # @param filters [Array<Module>, Array<Hash>] Filter for jobs to clear
       # @return [void]
       def enqueue!(filters = nil)
         filter = Filter.new(filters)
-        remaining_jobs = []
+        unmatched_jobs = []
+        pending_jobs = @jobs
         begin
           duplicates = Set.new
-          @jobs.each do |job|
+          until pending_jobs.empty?
+            job = pending_jobs.first
             if filter.match?(job.klass, job.opts)
+              suppress = false
               if unique_job?(job.klass, job.opts)
-                next if duplicates.include?([job.klass, job.args])
-                duplicates << [job.klass, job.args]
+                dedup_key = [job.klass, job.args, worker_options(job.klass, job.opts)["queue"]]
+                suppress = duplicates.include?(dedup_key)
+                duplicates << dedup_key
               end
-              if job.opts
-                job.klass.set(job.opts).perform_async(*job.args)
-              else
-                job.klass.perform_async(*job.args)
+              unless suppress
+                if job.opts
+                  job.klass.set(job.opts).perform_async(*job.args)
+                else
+                  job.klass.perform_async(*job.args)
+                end
               end
             else
-              remaining_jobs << job
+              unmatched_jobs << job
             end
+            pending_jobs.shift
           end
         ensure
-          @jobs = remaining_jobs
+          @jobs = unmatched_jobs + pending_jobs
         end
       end
 

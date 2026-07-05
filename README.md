@@ -98,6 +98,16 @@ end
 
 You can pass filters to the `Sidekiq.abort_deferred_jobs!` and `Sidekiq.enqueue_deferred_jobs!` methods if you want to enqueue or abort just specific jobs. These filters work the same as the fitlers to `Sidekiq.defer_jobs`.
 
+Scheduled jobs (i.e. `perform_in`, `perform_at`, or setting the `at` option) are never deferred since they are not enqueued to run immediately anyway.
+
+If an error is raised while the deferred jobs are being enqueued (for instance, if Redis is briefly unavailable), the error will be raised to the calling code. Any jobs that had not yet been enqueued when the error occurred will be retained in the deferred jobs list, so a call to `Sidekiq.enqueue_deferred_jobs!` can be safely retried from within the block without duplicating jobs that were already enqueued.
+
+## Limitations
+
+- Only jobs enqueued with `perform_async` are deferred. Jobs enqueued through other mechanisms (`perform_bulk`, `Sidekiq::Client.push`, or ActiveJob with the Sidekiq adapter) are not intercepted and will be enqueued immediately.
+
+- The list of deferred jobs is scoped to the current thread and fiber. Jobs enqueued from other threads or fibers spawned inside a `defer_jobs` block (including code using lazy enumerators or async frameworks that switch fibers) will not be deferred.
+
 Note that if you are running with a relational database you may want to use another mechanism to work with transactional data (i.e. the `after_commit` hook in ActiveRecord). However, if you have a single logical operation that contains multiple transactions, this mechanism could be a good fit. For example, if you have a complex business operation that updates multiple rows and calls external services, you may not want a single transaction since it could lock database rows for a long period creating performance problems. This gem could be used to orchestrate transactional logic for Sidekiq workers in systems with native transaction support.
 
 ## Installation
