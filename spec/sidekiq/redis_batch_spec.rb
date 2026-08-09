@@ -198,6 +198,17 @@ RSpec.describe Sidekiq::DeferredJobs::RedisBatch do
       expect(deferred_keys).to eq []
     end
 
+    it "refreshes the registry TTL on every deferred job" do
+      Sidekiq.defer_jobs do
+        TestWorker.perform_async(1)
+        # Shorten the registry TTL; the next deferred job must extend it again so the
+        # registry cannot expire while it still tracks a live batch.
+        redis_cmd("PEXPIRE", registry, 5_000)
+        TestWorker.perform_async(2)
+        expect(redis_cmd("PTTL", registry)).to be > 5_000
+      end
+    end
+
     it "raises an ArgumentError when deferring a job for an anonymous worker class" do
       anonymous_worker = Class.new do
         include SIDEKIQ_WORKER_MODULE
@@ -373,6 +384,46 @@ RSpec.describe Sidekiq::DeferredJobs::RedisBatch do
       expect(enqueued_args("high")).to eq [[1]]
     end
 
+    it "does not consume the orphan scan throttle when the flush fails" do
+      seed_batch("orphan-1", [[TestWorker, [7], nil]], score: now_ms - 10_000)
+      Sidekiq::DeferredJobs.grace_period = 1
+
+      Sidekiq.defer_jobs do
+        TestWorker.perform_async(1)
+
+        calls = 0
+        allow(Sidekiq).to receive(:redis).and_wrap_original do |original, &block|
+          raise "connection down" if (calls += 1) == 1
+          original.call(&block)
+        end
+        expect { Sidekiq.enqueue_deferred_jobs! }.to raise_error("connection down")
+        allow(Sidekiq).to receive(:redis).and_call_original
+
+        # The failed flush did not scan, so this flush scans again and reaps the orphan.
+        Sidekiq.enqueue_deferred_jobs!
+        expect(enqueued_args("high")).to match_array [[1], [7]]
+      end
+    end
+
+    it "enqueues reaped jobs of one worker class with a single bulk push" do
+      skip "Sidekiq #{Sidekiq::VERSION} has no bulk push" unless TestWorker.respond_to?(:perform_bulk)
+
+      seed_batch("orphan-1", [[TestWorker, [7], nil], [TestWorker, [8], nil], [TestWorker, [9], nil]], score: now_ms - 10_000)
+      Sidekiq::DeferredJobs.grace_period = 1
+
+      bulk_pushes = 0
+      allow(TestWorker).to receive(:perform_bulk).and_wrap_original do |original, *args|
+        bulk_pushes += 1
+        original.call(*args)
+      end
+
+      Sidekiq.defer_jobs { TestWorker.perform_async(1) }
+
+      expect(enqueued_args("high")).to eq [[1], [7], [8], [9]]
+      expect(bulk_pushes).to eq 1
+      expect(deferred_keys).to eq []
+    end
+
     it "moves unparseable payloads to the dead list instead of dropping them" do
       redis_cmd("RPUSH", "#{prefix}:batch:orphan-1", "not json")
       redis_cmd("ZADD", registry, now_ms - 10_000, "orphan-1")
@@ -398,6 +449,45 @@ RSpec.describe Sidekiq::DeferredJobs::RedisBatch do
         UniqueJobsWorker.perform_async(3)
       end
       expect(enqueued_args("high")).to eq [[1], [2], [3]]
+    end
+  end
+
+  # --- dead list -----------------------------------------------------------
+
+  describe "dead list" do
+    it "lists the payloads on the dead list" do
+      redis_cmd("RPUSH", "#{prefix}:dead", JSON.generate("class" => "NoSuchWorkerClass", "args" => [7], "opts" => nil, "attempts" => 5))
+      redis_cmd("RPUSH", "#{prefix}:dead", "not json")
+
+      expect(Sidekiq::DeferredJobs.dead_jobs).to eq [
+        {"class" => "NoSuchWorkerClass", "args" => [7], "opts" => nil, "attempts" => 5},
+        "not json"
+      ]
+      # Listing does not consume the payloads.
+      expect(dead_payloads.size).to eq 2
+    end
+
+    it "retries dead jobs with a fresh set of enqueue attempts" do
+      redis_cmd("RPUSH", "#{prefix}:dead", JSON.generate("class" => "TestWorker", "args" => [7], "opts" => nil, "attempts" => 5))
+
+      expect(Sidekiq::DeferredJobs.retry_dead_jobs!).to eq 1
+      expect(enqueued_args("high")).to eq [[7]]
+      expect(deferred_keys).to eq []
+    end
+
+    it "returns jobs that fail again to the dead list" do
+      Sidekiq::DeferredJobs.max_enqueue_attempts = 1
+      redis_cmd("RPUSH", "#{prefix}:dead", JSON.generate("class" => "NoSuchWorkerClass", "args" => [7], "opts" => nil, "attempts" => 5))
+
+      expect(Sidekiq::DeferredJobs.retry_dead_jobs!).to eq 1
+      expect(registry_ids).to eq []
+      expect(dead_payloads.size).to eq 1
+      expect(JSON.parse(dead_payloads.first)["class"]).to eq "NoSuchWorkerClass"
+    end
+
+    it "does nothing when the dead list is empty" do
+      expect(Sidekiq::DeferredJobs.retry_dead_jobs!).to eq 0
+      expect(Sidekiq::DeferredJobs.dead_jobs).to eq []
     end
   end
 

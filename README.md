@@ -102,6 +102,8 @@ Scheduled jobs (i.e. `perform_in`, `perform_at`, or setting the `at` option) are
 
 If an error is raised while the deferred jobs are being enqueued (for instance, if Redis is briefly unavailable), the error will be raised to the calling code. Any jobs that had not yet been enqueued when the error occurred will be retained in the deferred jobs list, so a call to `Sidekiq.enqueue_deferred_jobs!` can be safely retried from within the block without duplicating jobs that were already enqueued.
 
+One exception: if an error is raised while a *filtered* `Sidekiq.enqueue_deferred_jobs!` call is enqueuing jobs and non-matching jobs remain deferred, the matching jobs that were not yet enqueued are not returned to the deferred list. They stay safely in Redis and are enqueued by a flush in any process after the grace period (see Durability below).
+
 ## Durability
 
 While jobs are deferred they are persisted to Redis (using the same Redis that Sidekiq is configured with). This means that if a process crashes or is killed while inside a `defer_jobs` block, the deferred jobs are not lost.
@@ -118,7 +120,19 @@ Because any process sharing the Redis key prefix can reap an orphaned batch, the
 
 Because deferred jobs are serialized by class name, anonymous worker classes cannot be deferred and will raise an `ArgumentError`.
 
-When Sidekiq is running in a testing mode (`Sidekiq::Testing.fake!` or `Sidekiq::Testing.inline!`), deferred jobs are held in memory instead of Redis, so your test suite does not need a running Redis just to use this gem.
+The dead list can be inspected and replayed:
+
+```ruby
+# Returns the payloads on the dead list as parsed hashes (raw strings for payloads
+# that are not valid JSON).
+Sidekiq::DeferredJobs.dead_jobs
+
+# Enqueues the dead jobs again with a fresh set of enqueue attempts. Jobs that fail
+# again go back through the normal retry flow and eventually return to the dead list.
+Sidekiq::DeferredJobs.retry_dead_jobs!
+```
+
+When Sidekiq is running in a testing mode (`Sidekiq::Testing.fake!` or `Sidekiq::Testing.inline!`), deferred jobs are held in memory instead of Redis, so your test suite does not need a running Redis just to use this gem. Job arguments and options are still round-tripped through JSON in this mode (symbols become strings, for example), so filters match the same jobs in your test suite as they do in production.
 
 ### Configuration
 

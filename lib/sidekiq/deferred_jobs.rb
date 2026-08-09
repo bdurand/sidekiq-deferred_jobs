@@ -129,6 +129,29 @@ module Sidekiq
         end
       end
 
+      # Read the payloads on the dead list. These are jobs that repeatedly failed to
+      # enqueue and are kept in Redis for inspection. In a Sidekiq testing mode there is
+      # no dead list, so this returns an empty array.
+      #
+      # @return [Array<Hash, String>] parsed payload data, or the raw string for
+      #   payloads that are not valid JSON.
+      def dead_jobs
+        return [] if testing_mode?
+
+        RedisBatch.new.dead_jobs
+      end
+
+      # Enqueue the jobs on the dead list again with a fresh set of enqueue attempts.
+      # Jobs that fail again go back through the normal retry flow and eventually return
+      # to the dead list. In a Sidekiq testing mode this does nothing.
+      #
+      # @return [Integer] the number of payloads that were retried.
+      def retry_dead_jobs!
+        return 0 if testing_mode?
+
+        undeferred { RedisBatch.new.retry_dead! }
+      end
+
       # Return true if the options indicate a job scheduled to run in the future.
       # Scheduled jobs are never deferred since they are not enqueued immediately anyway.
       #
@@ -214,12 +237,17 @@ module Sidekiq
 
       private
 
+      # @return [Boolean] true when Sidekiq is running in a testing mode.
+      def testing_mode?
+        defined?(Sidekiq::Testing) && Sidekiq::Testing.enabled?
+      end
+
       # Select the storage backend for a new batch. When Sidekiq is running in a
       # testing mode, jobs are held in memory (as they always have been) so that the
       # test suite does not require a live Redis. Otherwise jobs are persisted to Redis
       # so they survive a process crash while deferred.
       def new_batch
-        if defined?(Sidekiq::Testing) && Sidekiq::Testing.enabled?
+        if testing_mode?
           MemoryBatch.new
         else
           RedisBatch.new
@@ -339,12 +367,17 @@ module Sidekiq
 
       # Add a job to the deferred job list.
       #
+      # Arguments and options are round-tripped through JSON so that this backend
+      # behaves the same as the Redis backend used in production (e.g. symbols become
+      # strings). Otherwise a filter could match a job in the test suite but not in
+      # production, or vice versa.
+      #
       # @param klass [Class] Sidekiq worker class.
       # @param args [Array] Sidekiq job arguments
       # @param opts [Hash, Nil] optional runtime jobs options
       # @return [void]
       def defer(klass, args, opts = nil)
-        @jobs << Job.new(klass, args&.dup, opts&.dup)
+        @jobs << Job.new(klass, normalize(args || []), normalize(opts))
       end
 
       # Clear any deferred jobs that match the filter.
@@ -390,6 +423,13 @@ module Sidekiq
         ensure
           @jobs = unmatched_jobs + pending_jobs
         end
+      end
+
+      private
+
+      # Round-trip a value through JSON to match how the Redis backend serializes jobs.
+      def normalize(value)
+        value.nil? ? nil : JSON.parse(JSON.generate(value))
       end
     end
   end

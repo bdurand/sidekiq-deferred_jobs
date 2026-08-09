@@ -93,6 +93,28 @@ RSpec.describe Sidekiq::DeferredJobs do
     end
   end
 
+  describe "argument normalization" do
+    it "normalizes arguments and options like the Redis backend does" do
+      Sidekiq.defer_jobs do
+        TestWorker.set(foo: :bazzle).perform_async(:arg)
+        # The filter matches the string value because the options were normalized the
+        # same way the Redis backend serializes them.
+        aborted_jobs = Sidekiq.abort_deferred_jobs!(foo: "bazzle")
+        expect(aborted_jobs.size).to eq 1
+        expect(aborted_jobs.first.args).to eq ["arg"]
+        expect(aborted_jobs.first.opts).to eq({"foo" => "bazzle"})
+      end
+      expect(TestWorker.jobs.size).to eq 0
+    end
+  end
+
+  describe "dead jobs" do
+    it "has no dead list in a testing mode" do
+      expect(Sidekiq::DeferredJobs.dead_jobs).to eq []
+      expect(Sidekiq::DeferredJobs.retry_dead_jobs!).to eq 0
+    end
+  end
+
   describe "Sidekiq.abort_deferred_jobs!" do
     it "should do nothing outside of a defer block" do
       TestWorker.perform_async("foobar", 1)

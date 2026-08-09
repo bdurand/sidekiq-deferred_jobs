@@ -64,16 +64,14 @@ module Sidekiq
       # ARGV[1] = batch id
       # ARGV[2] = ttl in ms
       # ARGV[3] = payload
-      # The registry TTL is only re-applied when the batch is added to it. The score of
-      # an existing entry is refreshed on every job, so a busy registry is kept alive by
-      # the batches that are added to it.
+      # The registry TTL is refreshed on every job so that the registry can never expire
+      # while a batch that it tracks is still deferring jobs.
       DEFER_SCRIPT = <<~LUA
         #{TIME_PREAMBLE}
         redis.call('RPUSH', KEYS[1], ARGV[3])
         redis.call('PEXPIRE', KEYS[1], ARGV[2])
-        if redis.call('ZADD', KEYS[2], now_ms, ARGV[1]) == 1 then
-          redis.call('PEXPIRE', KEYS[2], ARGV[2])
-        end
+        redis.call('ZADD', KEYS[2], now_ms, ARGV[1])
+        redis.call('PEXPIRE', KEYS[2], ARGV[2])
         return 1
       LUA
 
@@ -104,15 +102,26 @@ module Sidekiq
         local payloads = {}
         local own_count = 0
 
+        -- Move a batch list into the flush list. The first batch moved is renamed in
+        -- one O(1) command; later batches are appended in chunks small enough to stay
+        -- within Lua's argument stack.
         local function move_batch(id)
           local key = prefix .. id
           local items = redis.call('LRANGE', key, 0, -1)
-          redis.call('DEL', key)
-          redis.call('ZREM', registry, id)
-          for _, item in ipairs(items) do
-            redis.call('RPUSH', flush_key, item)
-            payloads[#payloads + 1] = item
+          if #items > 0 then
+            if redis.call('EXISTS', flush_key) == 0 then
+              redis.call('RENAME', key, flush_key)
+            else
+              for i = 1, #items, 512 do
+                redis.call('RPUSH', flush_key, unpack(items, i, math.min(i + 511, #items)))
+              end
+              redis.call('DEL', key)
+            end
+            for _, item in ipairs(items) do
+              payloads[#payloads + 1] = item
+            end
           end
+          redis.call('ZREM', registry, id)
           return #items
         end
 
@@ -143,16 +152,21 @@ module Sidekiq
       # was read (compare-and-swap). Optionally moves matched payloads into a new
       # in-flight list registered under the flush id.
       #
+      # The expected contents are compared by SHA1 digest rather than by shipping the
+      # expected payloads back over the network. The digest is computed over the payloads
+      # joined with a NUL byte, which is unambiguous because the payloads are JSON and
+      # JSON strings cannot contain a raw NUL byte.
+      #
       # KEYS[1] = batch list key
       # KEYS[2] = registry zset
       # KEYS[3] = in-flight list key (unused when there are no matched payloads)
       # ARGV[1] = batch id
       # ARGV[2] = flush id (or "" when there are no matched payloads)
       # ARGV[3] = ttl in ms
-      # ARGV[4] = number of expected payloads (E)
+      # ARGV[4] = SHA1 hex digest of the expected payloads joined with a NUL byte
       # ARGV[5] = number of remaining payloads (R)
       # ARGV[6] = number of matched payloads (M)
-      # ARGV[7...] = E expected payloads, then R remaining payloads, then M matched payloads
+      # ARGV[7...] = R remaining payloads, then M matched payloads
       #
       # Returns 1 on success or 0 when the list no longer matches the expected payloads.
       CAS_REWRITE_SCRIPT = <<~LUA
@@ -163,26 +177,26 @@ module Sidekiq
         local batch_id = ARGV[1]
         local flush_id = ARGV[2]
         local ttl_ms = ARGV[3]
-        local expected_count = tonumber(ARGV[4])
+        local expected_sha = ARGV[4]
         local remaining_count = tonumber(ARGV[5])
         local matched_count = tonumber(ARGV[6])
         local base = 6
 
         local current = redis.call('LRANGE', batch_key, 0, -1)
-        if #current ~= expected_count then
+        if redis.sha1hex(table.concat(current, '\\0')) ~= expected_sha then
           return 0
         end
-        for i = 1, expected_count do
-          if current[i] ~= ARGV[base + i] then
-            return 0
+
+        -- Push payloads in chunks small enough to stay within Lua's argument stack.
+        local function push_range(key, first, last)
+          for i = first, last, 512 do
+            redis.call('RPUSH', key, unpack(ARGV, i, math.min(i + 511, last)))
           end
         end
 
         redis.call('DEL', batch_key)
         if remaining_count > 0 then
-          for i = 1, remaining_count do
-            redis.call('RPUSH', batch_key, ARGV[base + expected_count + i])
-          end
+          push_range(batch_key, base + 1, base + remaining_count)
           redis.call('PEXPIRE', batch_key, ttl_ms)
           redis.call('ZADD', registry, now_ms, batch_id)
         else
@@ -190,9 +204,7 @@ module Sidekiq
         end
 
         if matched_count > 0 then
-          for i = 1, matched_count do
-            redis.call('RPUSH', flush_key, ARGV[base + expected_count + remaining_count + i])
-          end
+          push_range(flush_key, base + remaining_count + 1, base + remaining_count + matched_count)
           redis.call('PEXPIRE', flush_key, ttl_ms)
           redis.call('ZADD', registry, now_ms, flush_id)
         end
@@ -246,6 +258,29 @@ module Sidekiq
           redis.call('PEXPIRE', KEYS[3], ARGV[3])
         end
         return redis.call('LLEN', KEYS[1])
+      LUA
+
+      # Atomically move the entire dead list into a new in-flight list registered under
+      # the flush id so its payloads can be enqueued again.
+      #
+      # KEYS[1] = dead list key
+      # KEYS[2] = registry zset
+      # ARGV[1] = flush id
+      # ARGV[2] = batch key prefix ("<prefix>:batch:")
+      # ARGV[3] = ttl in ms
+      #
+      # Returns the payloads that were moved.
+      RETRY_DEAD_SCRIPT = <<~LUA
+        #{TIME_PREAMBLE}
+        local items = redis.call('LRANGE', KEYS[1], 0, -1)
+        if #items > 0 then
+          local flush_key = ARGV[2] .. ARGV[1]
+          redis.call('RENAME', KEYS[1], flush_key)
+          redis.call('PEXPIRE', flush_key, ARGV[3])
+          redis.call('ZADD', KEYS[2], now_ms, ARGV[1])
+          redis.call('PEXPIRE', KEYS[2], ARGV[3])
+        end
+        return items
       LUA
 
       # Cache of script SHA1 digests for EVALSHA.
@@ -337,6 +372,38 @@ module Sidekiq
         end
       end
 
+      # Read the payloads on the dead list.
+      #
+      # @return [Array<Hash, String>] parsed payload data, or the raw string for
+      #   payloads that are not valid JSON.
+      def dead_jobs
+        raw_payloads = Sidekiq.redis { |conn| command(conn, "LRANGE", dead_key, 0, -1) }
+        raw_payloads.map { |raw| parse_payload(raw) || raw }
+      end
+
+      # Enqueue the payloads on the dead list again with a fresh set of enqueue
+      # attempts. Payloads that fail again go back through the normal retry flow and
+      # eventually return to the dead list.
+      #
+      # @return [Integer] the number of payloads that were retried.
+      def retry_dead!
+        flush_id = SecureRandom.uuid
+        payloads = Sidekiq.redis do |conn|
+          eval_script(conn, RETRY_DEAD_SCRIPT, [dead_key, registry_key], [flush_id, "#{key_prefix}:batch:", ttl_ms])
+        end
+        payloads ||= []
+        return 0 if payloads.empty?
+
+        refreshed = payloads.map do |raw|
+          data = parse_payload(raw)
+          next raw unless data
+          data.delete("attempts")
+          JSON.generate(data)
+        end
+        drain(batch_key_for(flush_id), flush_id, refreshed, Set.new, contain_errors: true)
+        payloads.size
+      end
+
       private
 
       # Move the current batch and any orphans into an in-flight list, then drain it.
@@ -349,11 +416,17 @@ module Sidekiq
         flush_id = SecureRandom.uuid
         own_count = 0
         payloads = []
-        Sidekiq.redis do |conn|
-          result = eval_script(conn, FLUSH_AND_REAP_SCRIPT, [registry_key],
-            ["#{key_prefix}:batch:", @id.to_s, flush_id, grace_period_ms, reap ? max_orphans : 0, ttl_ms])
-          own_count = result[0].to_i
-          payloads = result[1] || []
+        begin
+          Sidekiq.redis do |conn|
+            result = eval_script(conn, FLUSH_AND_REAP_SCRIPT, [registry_key],
+              ["#{key_prefix}:batch:", @id.to_s, flush_id, grace_period_ms, reap ? max_orphans : 0, ttl_ms])
+            own_count = result[0].to_i
+            payloads = result[1] || []
+          end
+        rescue
+          # The orphan scan did not happen, so it must not count against the throttle.
+          self.class.reset_reap_throttle! if reap
+          raise
         end
         @id = nil
         drain_in_flight(flush_id, payloads, own_count, adopt_on_error: true)
@@ -390,19 +463,26 @@ module Sidekiq
         return if payloads.empty?
         flush_key = batch_key_for(flush_id)
         duplicates = Set.new
-        drain_own(flush_key, flush_id, payloads.first(own_count), duplicates, adopt_on_error: adopt_on_error)
-        drain_orphans(flush_key, flush_id, payloads.drop(own_count), duplicates)
+        drain(flush_key, flush_id, payloads.first(own_count), duplicates,
+          contain_errors: false, adopt_on_error: adopt_on_error)
+        drain(flush_key, flush_id, payloads.drop(own_count), duplicates, contain_errors: true)
       end
 
-      # Enqueue the caller's own payloads. Consecutive jobs that share a worker class and
-      # options are handed to Sidekiq in one bulk push and then acknowledged with one
-      # call, so a block that defers many jobs of the same kind costs a pair of round
-      # trips per group instead of a pair per job.
+      # Enqueue payloads in order. Consecutive jobs that share a worker class and options
+      # are handed to Sidekiq in one bulk push and then acknowledged with one call, so
+      # many jobs of the same kind cost a pair of round trips per group instead of a pair
+      # per job.
       #
-      # An error is propagated so that the caller knows the flush did not finish. The
-      # payloads that were not acknowledged stay in Redis and are enqueued again by a
-      # later flush, so no job is lost.
-      def drain_own(flush_key, flush_id, payloads, duplicates, adopt_on_error:)
+      # When contain_errors is false (the caller's own payloads), an error from Sidekiq
+      # is propagated so that the caller knows the flush did not finish. The payloads
+      # that were not acknowledged stay in Redis and are enqueued again by a later flush,
+      # so no job is lost.
+      #
+      # When contain_errors is true (payloads reaped from batches that other processes
+      # abandoned), an error is contained so that it cannot break the flush of an
+      # unrelated caller. The failed group is retried on later flushes until
+      # max_enqueue_attempts is reached and then moved to the dead list.
+      def drain(flush_key, flush_id, payloads, duplicates, contain_errors:, adopt_on_error: false)
         group = []
         pending_acks = 0
 
@@ -419,15 +499,22 @@ module Sidekiq
         push_group = lambda do
           next if group.empty?
           begin
-            DeferredJobs.perform_jobs(group)
-          rescue
+            DeferredJobs.perform_jobs(group.map { |_data, job| job })
+          rescue => e
             # Acknowledge the jobs that were enqueued so they are not enqueued twice.
-            # The failed group stays at the head of the in-flight list. Adopting the
-            # list as the current batch lets the caller retry it with
-            # enqueue_deferred_jobs!; otherwise it is reaped after the grace period.
+            # The failed group is at the head of the in-flight list.
             flush_acks.call
-            @id = flush_id if adopt_on_error
-            raise
+            unless contain_errors
+              # Adopting the list as the current batch lets the caller retry it with
+              # enqueue_deferred_jobs!; otherwise it is reaped after the grace period.
+              @id = flush_id if adopt_on_error
+              raise
+            end
+            group.each do |data, _job|
+              retry_or_bury(flush_key, flush_id, data, "#{e.class}: #{e.message}")
+            end
+            group.clear
+            next
           end
           pending_acks += group.size
           group.clear
@@ -443,6 +530,8 @@ module Sidekiq
             push_group.call
             flush_acks.call
             if data
+              # The class may be defined in another process (e.g. during a rolling
+              # deploy), so keep the payload and let a later flush retry it.
               retry_or_bury(flush_key, flush_id, data, "worker class #{data["class"].inspect} is not defined")
             else
               # An unparseable payload can never be enqueued; retrying it is pointless.
@@ -467,57 +556,15 @@ module Sidekiq
 
           # A bulk push can only carry jobs of one worker class with one set of options.
           leader = group.first
-          if leader && !(leader.klass == job.klass && leader.opts == job.opts)
+          if leader && !(leader[1].klass == job.klass && leader[1].opts == job.opts)
             push_group.call
           end
-          group << job
+          group << [data, job]
           push_group.call if group.size >= MAX_FLUSH_GROUP
         end
 
         push_group.call
         flush_acks.call
-      end
-
-      # Enqueue payloads reaped from batches that other processes abandoned. An error is
-      # contained here so that it cannot break the flush of an unrelated caller. Failed
-      # payloads are retried on later flushes until max_enqueue_attempts is reached and
-      # then moved to the dead list.
-      #
-      # These payloads come from other blocks and other worker classes, and each one has
-      # its own error handling, so they are enqueued one at a time.
-      def drain_orphans(flush_key, flush_id, payloads, duplicates)
-        payloads.each do |raw|
-          data = parse_payload(raw)
-          unless data
-            bury(flush_key, flush_id, raw, "payload is not valid JSON")
-            next
-          end
-
-          klass = constantize(data["class"])
-          unless klass
-            # The class may be defined in another process (e.g. during a rolling
-            # deploy), so keep the payload and let a later flush retry it.
-            retry_or_bury(flush_key, flush_id, data, "worker class #{data["class"].inspect} is not defined")
-            next
-          end
-
-          job = Job.new(klass, data["args"] || [], data["opts"])
-          suppress = false
-          if DeferredJobs.unique_job?(job.klass, job.opts)
-            dedup_key = DeferredJobs.dedup_key(job)
-            suppress = duplicates.include?(dedup_key)
-            duplicates << dedup_key
-          end
-
-          begin
-            DeferredJobs.perform_job(job) unless suppress
-          rescue => e
-            retry_or_bury(flush_key, flush_id, data, "#{e.class}: #{e.message}")
-            next
-          end
-
-          ack(flush_key, flush_id, 1)
-        end
       end
 
       # Split batch payload pairs by the filter. Payloads that cannot be deserialized
@@ -545,12 +592,16 @@ module Sidekiq
       end
 
       # Atomically rewrite the current batch if it still contains exactly the expected
-      # payloads. Matched payloads, if any, are moved to an in-flight list.
+      # payloads. Matched payloads, if any, are moved to an in-flight list. The expected
+      # payloads are compared by digest so they do not have to be sent back to Redis.
       #
       # @return [Boolean] true if the rewrite was applied.
       def cas_rewrite(expected, remaining, matched = [], flush_id = nil)
         flush_key = flush_id ? batch_key_for(flush_id) : batch_key
-        argv = [@id, flush_id.to_s, ttl_ms, expected.size, remaining.size, matched.size, *expected, *remaining, *matched]
+        # The payloads are digested as raw bytes so the string encoding reported by the
+        # Redis client cannot change the digest.
+        expected_sha = Digest::SHA1.hexdigest(expected.map(&:b).join("\0"))
+        argv = [@id, flush_id.to_s, ttl_ms, expected_sha, remaining.size, matched.size, *remaining, *matched]
         result = Sidekiq.redis do |conn|
           eval_script(conn, CAS_REWRITE_SCRIPT, [batch_key, registry_key, flush_key], argv)
         end

@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Each process scans for orphaned batches at most once per grace period instead of on every flush, so a single request can no longer be made to enqueue the jobs of many abandoned batches.
 - Reaped jobs that cannot be enqueued (for example, when the worker class is not defined in the reaping process, or enqueuing repeatedly raises an error) are retried on later flushes instead of being dropped, and are moved to a dead list in Redis after too many failed attempts. An error enqueuing a reaped orphan job is contained and cannot break the flush of the block that reaped it.
 - Added configuration options `Sidekiq::DeferredJobs.grace_period`, `.redis_key_prefix`, `.max_orphans_per_flush`, `.orphan_ttl`, and `.max_enqueue_attempts`.
+- Added `Sidekiq::DeferredJobs.dead_jobs` and `Sidekiq::DeferredJobs.retry_dead_jobs!` to inspect and replay jobs on the dead list.
 
 ### Changed
 
