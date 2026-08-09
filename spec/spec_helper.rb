@@ -71,11 +71,20 @@ RSpec.configure do |config|
   end
 end
 
+# Sidekiq renamed Sidekiq::Worker to Sidekiq::Job in 6.3. On earlier versions the name
+# Sidekiq::Job belongs to the job introspection class in sidekiq/api, so the presence of
+# the constant alone does not identify the worker mixin.
+SIDEKIQ_WORKER_MODULE = if Sidekiq.const_defined?(:Job, false) && !Sidekiq::Job.is_a?(Class)
+  Sidekiq::Job
+else
+  Sidekiq::Worker
+end
+
 module TestModule
 end
 
 class TestWorker
-  include(defined?(Sidekiq::Job) ? Sidekiq::Job : Sidekiq::Worker)
+  include SIDEKIQ_WORKER_MODULE
   include TestModule
 
   sidekiq_options queue: "high", foo: "bar"
@@ -85,7 +94,7 @@ class TestWorker
 end
 
 class UniqueWorker
-  include(defined?(Sidekiq::Job) ? Sidekiq::Job : Sidekiq::Worker)
+  include SIDEKIQ_WORKER_MODULE
 
   sidekiq_options unique_for: 60, queue: "low"
 
@@ -94,7 +103,7 @@ class UniqueWorker
 end
 
 class UniqueJobsWorker
-  include(defined?(Sidekiq::Job) ? Sidekiq::Job : Sidekiq::Worker)
+  include SIDEKIQ_WORKER_MODULE
 
   sidekiq_options lock: :until_executing, queue: "high"
 

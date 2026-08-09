@@ -16,6 +16,9 @@ RSpec.describe Sidekiq::DeferredJobs::RedisBatch do
 
   before do
     flush_redis!
+    # Each process only scans for orphans once per grace period, so the specs that need
+    # a scan start from a clean slate.
+    Sidekiq::DeferredJobs::RedisBatch.reset_reap_throttle!
   end
 
   after do
@@ -124,7 +127,34 @@ RSpec.describe Sidekiq::DeferredJobs::RedisBatch do
 
     it "keeps each job in Redis until it has been handed to Sidekiq" do
       counts_at_push_time = []
-      allow(TestWorker).to receive(:client_push).and_wrap_original do |original, *args|
+      record = lambda do |original, *args|
+        counts_at_push_time << total_deferred_payloads
+        original.call(*args)
+      end
+      # Jobs of different worker classes cannot be pushed as one bulk, so each of these
+      # is handed to Sidekiq on its own.
+      allow(TestWorker).to receive(:client_push).and_wrap_original(&record)
+      allow(UniqueWorker).to receive(:client_push).and_wrap_original(&record)
+
+      Sidekiq.defer_jobs do
+        TestWorker.perform_async(1)
+        UniqueWorker.perform_async(2)
+      end
+
+      # Jobs are popped from Redis only after they are handed to Sidekiq, so a crash at
+      # any point cannot lose a job. Both are still in Redis at both pushes because the
+      # pops are batched and happen at the end of the flush.
+      expect(counts_at_push_time).to eq [2, 2]
+      expect(deferred_keys).to eq []
+      expect(enqueued_args("high")).to eq [[1]]
+      expect(enqueued_args("low")).to eq [[2]]
+    end
+
+    it "keeps a group in Redis until the whole group has been handed to Sidekiq" do
+      skip "Sidekiq #{Sidekiq::VERSION} has no bulk push" unless TestWorker.respond_to?(:perform_bulk)
+
+      counts_at_push_time = []
+      allow(TestWorker).to receive(:perform_bulk).and_wrap_original do |original, *args|
         counts_at_push_time << total_deferred_payloads
         original.call(*args)
       end
@@ -134,16 +164,43 @@ RSpec.describe Sidekiq::DeferredJobs::RedisBatch do
         TestWorker.perform_async(2)
       end
 
-      # Each job is popped from Redis only after it is handed to Sidekiq, so a crash
-      # at any point cannot lose a job.
-      expect(counts_at_push_time).to eq [2, 1]
+      # Consecutive jobs of the same worker class are pushed together and popped only
+      # after Sidekiq has accepted all of them.
+      expect(counts_at_push_time).to eq [2]
       expect(deferred_keys).to eq []
       expect(enqueued_args("high")).to eq [[1], [2]]
     end
 
+    it "retains only the group that could not be enqueued" do
+      stub_const("Sidekiq::DeferredJobs::RedisBatch::MAX_FLUSH_GROUP", 5)
+      Sidekiq::DeferredJobs.grace_period = 1
+      pushes = 0
+      allow(Sidekiq::DeferredJobs).to receive(:perform_jobs).and_wrap_original do |original, jobs|
+        pushes += 1
+        raise "Boom!" if pushes == 3
+        original.call(jobs)
+      end
+
+      expect {
+        Sidekiq.defer_jobs { 12.times { |i| TestWorker.perform_async(i) } }
+      }.to raise_error("Boom!")
+
+      # The two groups that were enqueued are acknowledged; the failed group is retained.
+      expect(enqueued_args("high")).to eq (0..9).zip
+      expect(batch_payloads(registry_ids.first).size).to eq 2
+
+      # A later flush delivers the retained jobs, and delivers nothing a second time.
+      make_idle(registry_ids.first)
+      Sidekiq::DeferredJobs::RedisBatch.reset_reap_throttle!
+      flush_from_another_process!
+
+      expect(enqueued_args("high")).to eq (0..11).zip
+      expect(deferred_keys).to eq []
+    end
+
     it "raises an ArgumentError when deferring a job for an anonymous worker class" do
       anonymous_worker = Class.new do
-        include(defined?(Sidekiq::Job) ? Sidekiq::Job : Sidekiq::Worker)
+        include SIDEKIQ_WORKER_MODULE
       end
 
       Sidekiq.defer_jobs do
@@ -238,11 +295,30 @@ RSpec.describe Sidekiq::DeferredJobs::RedisBatch do
 
       # Second attempt reaches the limit and the job is moved to the dead list.
       redis_cmd("ZADD", registry, now_ms - 10_000, registry_ids.first)
+      Sidekiq::DeferredJobs::RedisBatch.reset_reap_throttle!
       Sidekiq.defer_jobs { TestWorker.perform_async(2) }
 
       expect(registry_ids).to eq []
       expect(dead_payloads.size).to eq 1
       expect(JSON.parse(dead_payloads.first)["class"]).to eq "NoSuchWorkerClass"
+    end
+
+    it "scans for orphans at most once per grace period in each process" do
+      Sidekiq::DeferredJobs.grace_period = 300
+      seed_batch("orphan-1", [[TestWorker, [7], nil]], score: now_ms - 10_000_000)
+
+      Sidekiq.defer_jobs { TestWorker.perform_async(1) }
+      expect(enqueued_args("high")).to eq [[1], [7]]
+
+      # The next flush is well inside the grace period, so it does not scan again and
+      # leaves the orphan for later.
+      seed_batch("orphan-2", [[TestWorker, [8], nil]], score: now_ms - 10_000_000)
+      Sidekiq.defer_jobs { TestWorker.perform_async(2) }
+      expect(enqueued_args("high")).to eq [[1], [7], [2]]
+
+      Sidekiq::DeferredJobs::RedisBatch.reset_reap_throttle!
+      Sidekiq.defer_jobs { TestWorker.perform_async(3) }
+      expect(enqueued_args("high")).to eq [[1], [7], [2], [3], [8]]
     end
 
     it "does not re-enqueue jobs that were reaped while the block was still open" do

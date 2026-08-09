@@ -19,12 +19,14 @@ module Sidekiq
     #   1. A Lua script atomically moves the batch's payloads (plus the payloads of any
     #      orphaned batches abandoned by dead processes) into a fresh in-flight list that
     #      is registered in the ZSET like any other batch.
-    #   2. Each job is enqueued to Sidekiq and only then popped from the in-flight list.
+    #   2. The jobs are enqueued to Sidekiq and only then popped from the in-flight list.
     #
     # If the process dies at any point, the payloads still in the in-flight list are
     # reaped as an orphan by a later flush in any process. This makes delivery
-    # at-least-once: a crash between enqueuing a job and popping it can deliver that one
-    # job twice, but a job can never be silently lost.
+    # at-least-once: a crash between enqueuing a job and popping it can deliver that job
+    # twice, but a job can never be silently lost. Jobs are enqueued and popped in groups
+    # of up to MAX_FLUSH_GROUP to keep the number of round trips low, so a crash can
+    # repeat a whole group rather than a single job.
     #
     # All timestamps are taken from the Redis server clock (TIME) so that clock skew
     # between application hosts cannot cause premature orphan reaping.
@@ -36,6 +38,16 @@ module Sidekiq
       # need to be retried when another process reaps the batch mid-rewrite, so in
       # practice a single retry is already rare.
       MAX_CAS_ATTEMPTS = 10
+
+      # Maximum number of the caller's own jobs handed to Sidekiq before they are
+      # acknowledged in Redis. A larger group needs fewer round trips, but a process that
+      # dies in the middle of a flush re-delivers the whole unacknowledged group instead
+      # of a single job.
+      MAX_FLUSH_GROUP = 100
+
+      # Guards the timestamp of the last orphan scan made by this process.
+      REAP_MUTEX = Mutex.new
+      private_constant :REAP_MUTEX
 
       # Lua fragment defining now_ms() from the Redis server clock. Scripts that call
       # TIME must declare effect replication for Redis versions before 5.0.
@@ -52,13 +64,17 @@ module Sidekiq
       # ARGV[1] = batch id
       # ARGV[2] = ttl in ms
       # ARGV[3] = payload
+      # The registry TTL is only re-applied when the batch is added to it. The score of
+      # an existing entry is refreshed on every job, so a busy registry is kept alive by
+      # the batches that are added to it.
       DEFER_SCRIPT = <<~LUA
         #{TIME_PREAMBLE}
         redis.call('RPUSH', KEYS[1], ARGV[3])
         redis.call('PEXPIRE', KEYS[1], ARGV[2])
-        redis.call('ZADD', KEYS[2], now_ms, ARGV[1])
-        redis.call('PEXPIRE', KEYS[2], ARGV[2])
-        return redis.call('LLEN', KEYS[1])
+        if redis.call('ZADD', KEYS[2], now_ms, ARGV[1]) == 1 then
+          redis.call('PEXPIRE', KEYS[2], ARGV[2])
+        end
+        return 1
       LUA
 
       # Atomically move the current batch plus any orphaned batches into a new in-flight
@@ -185,24 +201,27 @@ module Sidekiq
         return 1
       LUA
 
-      # Acknowledge the head payload of an in-flight list after it has been handed to
-      # Sidekiq, and keep the registry entry fresh while a long drain is in progress.
+      # Acknowledge payloads at the head of an in-flight list after they have been handed
+      # to Sidekiq, and keep the registry entry fresh while a long drain is in progress.
       #
       # KEYS[1] = in-flight list key
       # KEYS[2] = registry zset
       # ARGV[1] = flush id
       # ARGV[2] = ttl in ms
+      # ARGV[3] = number of payloads to acknowledge
       ACK_SCRIPT = <<~LUA
-        #{TIME_PREAMBLE}
-        redis.call('LPOP', KEYS[1])
-        if redis.call('LLEN', KEYS[1]) == 0 then
+        redis.replicate_commands()
+        redis.call('LTRIM', KEYS[1], ARGV[3], -1)
+        local remaining = redis.call('LLEN', KEYS[1])
+        if remaining == 0 then
           redis.call('ZREM', KEYS[2], ARGV[1])
         else
-          redis.call('ZADD', KEYS[2], now_ms, ARGV[1])
+          local time = redis.call('TIME')
+          redis.call('ZADD', KEYS[2], (time[1] * 1000) + math.floor(time[2] / 1000), ARGV[1])
           redis.call('PEXPIRE', KEYS[1], ARGV[2])
           redis.call('PEXPIRE', KEYS[2], ARGV[2])
         end
-        return redis.call('LLEN', KEYS[1])
+        return remaining
       LUA
 
       # Move the head payload of an in-flight list to the tail of a target list. Used to
@@ -232,6 +251,35 @@ module Sidekiq
       # Cache of script SHA1 digests for EVALSHA.
       SCRIPT_SHAS = {}
       private_constant :SCRIPT_SHAS
+
+      class << self
+        # The orphan scan reads the registry on every flush, and a flush that finds
+        # orphans must enqueue all of their jobs before it can return. Limiting the scan
+        # to once per grace period keeps that cost off the majority of flushes. A batch
+        # is only eligible to be reaped once it has been idle for longer than the grace
+        # period, so this does not delay recovery in any meaningful way.
+        #
+        # @return [Boolean] true if this process should scan for orphans now.
+        # @api private
+        def reap_due?
+          # Fully qualified because Sidekiq defines its own Process class.
+          now = ::Process.clock_gettime(::Process::CLOCK_MONOTONIC)
+          REAP_MUTEX.synchronize do
+            return false if @last_reap_at && now - @last_reap_at < DeferredJobs.grace_period
+            @last_reap_at = now
+            true
+          end
+        end
+
+        # Forget when this process last scanned for orphans so that the next flush scans
+        # again.
+        #
+        # @return [void]
+        # @api private
+        def reset_reap_throttle!
+          REAP_MUTEX.synchronize { @last_reap_at = nil }
+        end
+      end
 
       def initialize
         @id = nil
@@ -293,12 +341,17 @@ module Sidekiq
 
       # Move the current batch and any orphans into an in-flight list, then drain it.
       def full_flush
+        reap = self.class.reap_due?
+        # Nothing was deferred and it is not this process's turn to scan for orphans, so
+        # the flush has no work to do at all.
+        return if @id.nil? && !reap
+
         flush_id = SecureRandom.uuid
         own_count = 0
         payloads = []
         Sidekiq.redis do |conn|
           result = eval_script(conn, FLUSH_AND_REAP_SCRIPT, [registry_key],
-            ["#{key_prefix}:batch:", @id.to_s, flush_id, grace_period_ms, max_orphans, ttl_ms])
+            ["#{key_prefix}:batch:", @id.to_s, flush_id, grace_period_ms, reap ? max_orphans : 0, ttl_ms])
           own_count = result[0].to_i
           payloads = result[1] || []
         end
@@ -326,24 +379,116 @@ module Sidekiq
         raise ConcurrencyError, "batch #{@id} was repeatedly modified by another process"
       end
 
-      # Enqueue the payloads of an in-flight list in order. Each payload is popped from
-      # the list only after it has been handed to Sidekiq, so a crash mid-drain leaves
-      # the unfinished jobs in Redis to be reaped later instead of losing them.
+      # Enqueue the payloads of an in-flight list in order. Payloads are popped from the
+      # list only after they have been handed to Sidekiq, so a crash mid-drain leaves the
+      # unfinished jobs in Redis to be reaped later instead of losing them.
       #
-      # The first own_count payloads belong to the caller's own block; an error enqueuing
-      # one of them is propagated so the caller can retry. The rest were reaped from
-      # orphaned batches abandoned by other processes; an error enqueuing one of those is
-      # contained here so it cannot break an unrelated caller's flush. Failed orphan
-      # payloads are retried on later flushes until max_enqueue_attempts is reached and
-      # then moved to the dead list.
+      # The first own_count payloads belong to the caller's own block; the rest were
+      # reaped from orphaned batches abandoned by other processes. The two groups have
+      # different error handling, so they are drained separately.
       def drain_in_flight(flush_id, payloads, own_count, adopt_on_error:)
         return if payloads.empty?
         flush_key = batch_key_for(flush_id)
         duplicates = Set.new
-        payloads.each_with_index do |raw, index|
+        drain_own(flush_key, flush_id, payloads.first(own_count), duplicates, adopt_on_error: adopt_on_error)
+        drain_orphans(flush_key, flush_id, payloads.drop(own_count), duplicates)
+      end
+
+      # Enqueue the caller's own payloads. Consecutive jobs that share a worker class and
+      # options are handed to Sidekiq in one bulk push and then acknowledged with one
+      # call, so a block that defers many jobs of the same kind costs a pair of round
+      # trips per group instead of a pair per job.
+      #
+      # An error is propagated so that the caller knows the flush did not finish. The
+      # payloads that were not acknowledged stay in Redis and are enqueued again by a
+      # later flush, so no job is lost.
+      def drain_own(flush_key, flush_id, payloads, duplicates, adopt_on_error:)
+        group = []
+        pending_acks = 0
+
+        # Pop the payloads whose jobs Sidekiq has already accepted.
+        flush_acks = lambda do
+          if pending_acks > 0
+            ack(flush_key, flush_id, pending_acks)
+            pending_acks = 0
+          end
+        end
+
+        # Hand the accumulated group to Sidekiq. The payloads only become acknowledgeable
+        # once Sidekiq has accepted them.
+        push_group = lambda do
+          next if group.empty?
+          begin
+            DeferredJobs.perform_jobs(group)
+          rescue
+            # Acknowledge the jobs that were enqueued so they are not enqueued twice.
+            # The failed group stays at the head of the in-flight list. Adopting the
+            # list as the current batch lets the caller retry it with
+            # enqueue_deferred_jobs!; otherwise it is reaped after the grace period.
+            flush_acks.call
+            @id = flush_id if adopt_on_error
+            raise
+          end
+          pending_acks += group.size
+          group.clear
+          flush_acks.call if pending_acks >= MAX_FLUSH_GROUP
+        end
+
+        payloads.each do |raw|
+          data = parse_payload(raw)
+          klass = data && constantize(data["class"])
+          unless klass
+            # The failed payload is handled on its own, so everything ahead of it in the
+            # list has to be enqueued and acknowledged first.
+            push_group.call
+            flush_acks.call
+            if data
+              retry_or_bury(flush_key, flush_id, data, "worker class #{data["class"].inspect} is not defined")
+            else
+              # An unparseable payload can never be enqueued; retrying it is pointless.
+              bury(flush_key, flush_id, raw, "payload is not valid JSON")
+            end
+            next
+          end
+
+          job = Job.new(klass, data["args"] || [], data["opts"])
+          if DeferredJobs.unique_job?(job.klass, job.opts)
+            dedup_key = DeferredJobs.dedup_key(job)
+            if duplicates.include?(dedup_key)
+              # The duplicate is not enqueued, but it can only be acknowledged once the
+              # jobs ahead of it in the list have been enqueued.
+              push_group.call
+              pending_acks += 1
+              flush_acks.call if pending_acks >= MAX_FLUSH_GROUP
+              next
+            end
+            duplicates << dedup_key
+          end
+
+          # A bulk push can only carry jobs of one worker class with one set of options.
+          leader = group.first
+          if leader && !(leader.klass == job.klass && leader.opts == job.opts)
+            push_group.call
+          end
+          group << job
+          push_group.call if group.size >= MAX_FLUSH_GROUP
+        end
+
+        push_group.call
+        flush_acks.call
+      end
+
+      # Enqueue payloads reaped from batches that other processes abandoned. An error is
+      # contained here so that it cannot break the flush of an unrelated caller. Failed
+      # payloads are retried on later flushes until max_enqueue_attempts is reached and
+      # then moved to the dead list.
+      #
+      # These payloads come from other blocks and other worker classes, and each one has
+      # its own error handling, so they are enqueued one at a time.
+      def drain_orphans(flush_key, flush_id, payloads, duplicates)
+        payloads.each do |raw|
           data = parse_payload(raw)
           unless data
-            # An unparseable payload can never be enqueued; retrying it is pointless.
             bury(flush_key, flush_id, raw, "payload is not valid JSON")
             next
           end
@@ -367,18 +512,11 @@ module Sidekiq
           begin
             DeferredJobs.perform_job(job) unless suppress
           rescue => e
-            if index < own_count
-              # The payload stays at the head of the in-flight list. Adopting the list
-              # as the current batch lets the caller retry it with
-              # enqueue_deferred_jobs!; otherwise it is reaped after the grace period.
-              @id = flush_id if adopt_on_error
-              raise
-            end
             retry_or_bury(flush_key, flush_id, data, "#{e.class}: #{e.message}")
             next
           end
 
-          ack(flush_key, flush_id)
+          ack(flush_key, flush_id, 1)
         end
       end
 
@@ -419,10 +557,11 @@ module Sidekiq
         result.to_i == 1
       end
 
-      # Pop the head of the in-flight list after its job has been handed to Sidekiq.
-      def ack(flush_key, flush_id)
+      # Pop payloads from the head of the in-flight list after their jobs have been
+      # handed to Sidekiq.
+      def ack(flush_key, flush_id, count)
         Sidekiq.redis do |conn|
-          eval_script(conn, ACK_SCRIPT, [flush_key, registry_key], [flush_id, ttl_ms])
+          eval_script(conn, ACK_SCRIPT, [flush_key, registry_key], [flush_id, ttl_ms, count])
         end
       end
 

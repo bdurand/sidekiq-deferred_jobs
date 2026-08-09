@@ -153,6 +153,30 @@ module Sidekiq
         end
       end
 
+      # Enqueue a run of deferred jobs that all share a worker class and the same
+      # options. Sidekiq can push several such jobs in a single round trip, which is much
+      # cheaper than one push per job. Sidekiq versions before 6.3 have no bulk push, so
+      # the jobs are enqueued one at a time there.
+      #
+      # @param jobs [Array<Sidekiq::DeferredJobs::Job>]
+      # @return [void]
+      # @api private
+      def perform_jobs(jobs)
+        first = jobs.first
+        return unless first
+
+        if jobs.size == 1 || !first.klass.respond_to?(:perform_bulk)
+          jobs.each { |job| perform_job(job) }
+        else
+          args = jobs.collect { |job| job.args || [] }
+          if first.opts
+            first.klass.set(first.opts).perform_bulk(args)
+          else
+            first.klass.perform_bulk(args)
+          end
+        end
+      end
+
       # @return [Boolean] true if the worker supports a uniqueness constraint.
       # @api private
       def unique_job?(klass, opts)
