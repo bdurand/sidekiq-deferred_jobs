@@ -463,8 +463,13 @@ module Sidekiq
         return if payloads.empty?
         flush_key = batch_key_for(flush_id)
         duplicates = Set.new
+        # The list can only be adopted as the current batch when it holds nothing but the
+        # caller's own payloads. Adopting a list that also holds reaped payloads would
+        # make those foreign jobs the caller's own on a later flush, and an error from one
+        # of them would then break the caller's block instead of being contained.
+        own_only = (own_count == payloads.size)
         drain(flush_key, flush_id, payloads.first(own_count), duplicates,
-          contain_errors: false, adopt_on_error: adopt_on_error)
+          contain_errors: false, adopt_on_error: adopt_on_error && own_only)
         drain(flush_key, flush_id, payloads.drop(own_count), duplicates, contain_errors: true)
       end
 
@@ -541,8 +546,22 @@ module Sidekiq
           end
 
           job = Job.new(klass, data["args"] || [], data["opts"])
-          if DeferredJobs.unique_job?(job.klass, job.opts)
-            dedup_key = DeferredJobs.dedup_key(job)
+          begin
+            dedup_key = DeferredJobs.unique_job?(job.klass, job.opts) ? DeferredJobs.dedup_key(job) : nil
+          rescue => e
+            # The payload names a constant that cannot be used as a Sidekiq worker, so it
+            # is handled like a failed enqueue rather than allowed to break the flush.
+            push_group.call
+            flush_acks.call
+            unless contain_errors
+              @id = flush_id if adopt_on_error
+              raise
+            end
+            retry_or_bury(flush_key, flush_id, data, "#{e.class}: #{e.message}")
+            next
+          end
+
+          if dedup_key
             if duplicates.include?(dedup_key)
               # The duplicate is not enqueued, but it can only be acknowledged once the
               # jobs ahead of it in the list have been enqueued.
@@ -620,11 +639,11 @@ module Sidekiq
       # once it has failed too many times.
       def retry_or_bury(flush_key, flush_id, data, reason)
         attempts = data["attempts"].to_i + 1
+        payload = JSON.generate(data.merge("attempts" => attempts))
         if attempts >= DeferredJobs.max_enqueue_attempts
-          bury(flush_key, flush_id, JSON.generate(data), reason)
+          bury(flush_key, flush_id, payload, reason)
         else
           Sidekiq.logger.warn("sidekiq-deferred_jobs: could not enqueue deferred job #{data["class"]} (#{reason}); attempt #{attempts} of #{DeferredJobs.max_enqueue_attempts}")
-          payload = JSON.generate(data.merge("attempts" => attempts))
           requeue_head(flush_key, flush_key, flush_id, payload)
         end
       end
@@ -642,11 +661,8 @@ module Sidekiq
       end
 
       def serialize(klass, args, opts)
-        name = klass.name
-        if name.nil? || name.empty?
-          raise ArgumentError, "cannot defer a job for an anonymous worker class; deferred jobs are serialized by class name"
-        end
-        JSON.generate("class" => name, "args" => args || [], "opts" => opts)
+        DeferredJobs.validate_worker_class!(klass)
+        JSON.generate("class" => klass.name, "args" => args || [], "opts" => opts)
       end
 
       def parse_payload(raw)

@@ -290,6 +290,54 @@ RSpec.describe Sidekiq::DeferredJobs::RedisBatch do
       expect(JSON.parse(retained.first)["attempts"]).to eq 1
     end
 
+    it "contains an error raised while interpreting a reaped payload" do
+      # The uniqueness lookup asks the worker class for its sidekiq_options, which a
+      # payload naming a constant that is not a Sidekiq worker cannot answer.
+      stub_const("SidekiqUniqueJobs", Module.new)
+      stub_const("NotAWorker", Class.new)
+      seed_batch("orphan-1", [["NotAWorker", [7], nil]], score: now_ms - 10_000)
+      Sidekiq::DeferredJobs.grace_period = 1
+
+      expect {
+        Sidekiq.defer_jobs { TestWorker.perform_async(1) }
+      }.not_to raise_error
+
+      expect(enqueued_args("high")).to eq [[1]]
+      # The unusable payload is retained like any other job that could not be enqueued.
+      retained = batch_payloads(registry_ids.first)
+      expect(retained.size).to eq 1
+      expect(JSON.parse(retained.first)["attempts"]).to eq 1
+    end
+
+    it "does not adopt an in-flight list that also holds reaped jobs" do
+      seed_batch("orphan-1", [[UniqueWorker, [7], nil]], score: now_ms - 10_000)
+      Sidekiq::DeferredJobs.grace_period = 5
+      # The reaped job can never be enqueued in this process.
+      allow(UniqueWorker).to receive(:client_push).and_raise("Boom!")
+
+      expect {
+        Sidekiq.defer_jobs do
+          TestWorker.perform_async(1)
+
+          allow(TestWorker).to receive(:client_push).and_raise("Own boom!")
+          expect { Sidekiq.enqueue_deferred_jobs! }.to raise_error("Own boom!")
+          allow(TestWorker).to receive(:client_push).and_call_original
+        end
+      }.not_to raise_error
+
+      # The in-flight list holds a reaped job, so it is left to be reaped again rather
+      # than adopted as the block's own batch. A later flush enqueues the block's job and
+      # still contains the reaped job's failure.
+      make_idle(registry_ids.first)
+      Sidekiq::DeferredJobs::RedisBatch.reset_reap_throttle!
+      expect { flush_from_another_process! }.not_to raise_error
+
+      expect(enqueued_args("high")).to eq [[1]]
+      retained = batch_payloads(registry_ids.first)
+      expect(retained.size).to eq 1
+      expect(JSON.parse(retained.first)["attempts"]).to eq 1
+    end
+
     it "retries a reaped job whose worker class is not defined, then moves it to the dead list" do
       seed_batch("orphan-1", [["NoSuchWorkerClass", [7], nil]], score: now_ms - 10_000)
       Sidekiq::DeferredJobs.grace_period = 1
@@ -512,6 +560,26 @@ RSpec.describe Sidekiq::DeferredJobs::RedisBatch do
         Sidekiq.enqueue_deferred_jobs!
         expect(enqueued_args("high")).to eq [[1], [3]]
         expect(enqueued_args("low")).to eq [[2]]
+      end
+      expect(deferred_keys).to eq []
+    end
+
+    it "propagates an error raised while interpreting one of the block's own payloads" do
+      # The uniqueness lookup asks the worker class for its sidekiq_options.
+      stub_const("SidekiqUniqueJobs", Module.new)
+
+      Sidekiq.defer_jobs do
+        TestWorker.perform_async(1)
+
+        allow(TestWorker).to receive(:sidekiq_options).and_raise("Boom!")
+        expect { Sidekiq.enqueue_deferred_jobs! }.to raise_error("Boom!")
+        expect(enqueued_args("high")).to eq []
+        # The job remains durably in Redis so the flush can be retried.
+        expect(batch_payloads(registry_ids.first).size).to eq 1
+
+        allow(TestWorker).to receive(:sidekiq_options).and_call_original
+        Sidekiq.enqueue_deferred_jobs!
+        expect(enqueued_args("high")).to eq [[1]]
       end
       expect(deferred_keys).to eq []
     end

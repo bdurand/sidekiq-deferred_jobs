@@ -224,6 +224,19 @@ module Sidekiq
         [job.klass, job.args, worker_options(job.klass, job.opts)["queue"]]
       end
 
+      # Deferred jobs are serialized by class name, so a class without a name can never
+      # be restored.
+      #
+      # @param klass [Class] Sidekiq worker class.
+      # @return [void]
+      # @api private
+      def validate_worker_class!(klass)
+        name = klass.name
+        if name.nil? || name.empty?
+          raise ArgumentError, "cannot defer a job for an anonymous worker class; deferred jobs are serialized by class name"
+        end
+      end
+
       # Merge runtime options with the worker class sidekiq_options.
       #
       # @api private
@@ -377,6 +390,7 @@ module Sidekiq
       # @param opts [Hash, Nil] optional runtime jobs options
       # @return [void]
       def defer(klass, args, opts = nil)
+        DeferredJobs.validate_worker_class!(klass)
         @jobs << Job.new(klass, normalize(args || []), normalize(opts))
       end
 
