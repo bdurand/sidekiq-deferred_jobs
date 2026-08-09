@@ -21,7 +21,23 @@ end
 
 require_relative "../lib/sidekiq-deferred_jobs"
 
-require "sidekiq/testing"
+# Run a block with stderr discarded. Used to keep the spec output readable.
+def silence_stderr
+  return yield if ENV["VERBOSE"]
+
+  original = $stderr
+  $stderr = File.open(File::NULL, "w")
+  begin
+    yield
+  ensure
+    $stderr.close
+    $stderr = original
+  end
+end
+
+# Newer versions of Sidekiq warn that this API is deprecated. The gem supports Sidekiq
+# back to 5.0, so the replacement API is not available on every supported version.
+silence_stderr { require "sidekiq/testing" }
 
 # Point Sidekiq at the Redis used by the docker-compose valkey service. This is only
 # actually connected to by the specs that exercise the Redis backend (with testing mode
@@ -29,6 +45,12 @@ require "sidekiq/testing"
 REDIS_URL = ENV["REDIS_URL"] || "redis://localhost:#{ENV["REDIS_PORT"] || 6390}/0"
 Sidekiq.configure_client do |config|
   config.redis = {url: REDIS_URL}
+
+  # Several specs deliberately exercise paths that log a warning or an error, so the
+  # log output is noise that hides the actual spec results. Set VERBOSE=1 to see it.
+  if config.respond_to?(:logger=) && !ENV["VERBOSE"]
+    config.logger = Logger.new(File::NULL)
+  end
 end
 
 # Flush the Redis database. Used by specs that exercise the Redis backend.
