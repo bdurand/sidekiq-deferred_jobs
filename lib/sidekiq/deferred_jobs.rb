@@ -7,8 +7,8 @@ require "sidekiq"
 
 module Sidekiq
   module DeferredJobs
-    # Default number of seconds after which a batch that was never flushed is
-    # considered orphaned and eligible to be reaped by another process.
+    # Default number of seconds of inactivity after which a batch that was never
+    # flushed is considered orphaned and eligible to be reaped by another process.
     DEFAULT_GRACE_PERIOD = 300
 
     # Default Redis key prefix used for all keys created by this gem.
@@ -21,10 +21,18 @@ module Sidekiq
     # batches which are never reaped still expire from Redis.
     DEFAULT_ORPHAN_TTL = 86_400
 
-    class << self
-      attr_writer :grace_period, :redis_key_prefix, :max_orphans_per_flush, :orphan_ttl
+    # Default number of times an orphaned job that cannot be enqueued (for instance,
+    # because its worker class is not defined in the reaping process) is retried on
+    # later flushes before it is moved to the dead list.
+    DEFAULT_MAX_ENQUEUE_ATTEMPTS = 5
 
-      # @return [Integer] seconds before an unflushed batch may be reaped as an orphan.
+    # Raised when a batch rewrite repeatedly loses a race with another process.
+    ConcurrencyError = Class.new(StandardError)
+
+    class << self
+      attr_writer :grace_period, :redis_key_prefix, :max_orphans_per_flush, :orphan_ttl, :max_enqueue_attempts
+
+      # @return [Integer] seconds of inactivity before an unflushed batch may be reaped as an orphan.
       def grace_period
         @grace_period || DEFAULT_GRACE_PERIOD
       end
@@ -42,6 +50,12 @@ module Sidekiq
       # @return [Integer] backstop TTL in seconds applied to batch list keys.
       def orphan_ttl
         @orphan_ttl || DEFAULT_ORPHAN_TTL
+      end
+
+      # @return [Integer] number of enqueue attempts for an orphaned job before it is
+      #   moved to the dead list.
+      def max_enqueue_attempts
+        @max_enqueue_attempts || DEFAULT_MAX_ENQUEUE_ATTEMPTS
       end
 
       # Defer enqueuing Sidekiq workers within the block until the end of the block.

@@ -106,17 +106,23 @@ If an error is raised while the deferred jobs are being enqueued (for instance, 
 
 While jobs are deferred they are persisted to Redis (using the same Redis that Sidekiq is configured with). This means that if a process crashes or is killed while inside a `defer_jobs` block, the deferred jobs are not lost.
 
-Each deferred job is written to Redis as soon as it would have been enqueued. When the block finishes and the jobs are enqueued to Sidekiq, they are atomically popped from Redis. That same atomic operation also reaps any **orphaned** jobs — jobs that were left in Redis by a process that died before it could enqueue them — and enqueues them as well. The pop-and-reap is performed by a single Lua script, so it is safe to run concurrently across many processes: each deferred job is guaranteed to be enqueued exactly once, and never twice.
+Each deferred job is written to Redis as soon as it would have been enqueued. When the block finishes, a Lua script atomically moves the batch into an in-flight list, and each job is removed from that list only after it has been handed to Sidekiq. That same atomic operation also reaps any **orphaned** jobs — jobs that were left in Redis by a process that died before it could enqueue them — and enqueues them as well.
 
-A batch is considered orphaned once it is older than the configurable grace period. The grace period should be comfortably longer than the longest `defer_jobs` block you expect to run.
+Delivery is therefore **at least once**: a job can never be silently lost, but if a process dies at exactly the wrong moment (after handing a job to Sidekiq but before acknowledging it in Redis), that one job can be enqueued a second time when it is later reaped as an orphan. Sidekiq itself has the same at-least-once semantics, so workers should be idempotent anyway.
+
+A batch is considered orphaned once no job has been deferred to it for longer than the configurable grace period. The grace period should be comfortably longer than the longest gap you expect between deferring jobs inside a `defer_jobs` block. If a live block is quiet for longer than the grace period, another process can reap its batch and enqueue its jobs early. Orphan timestamps are taken from the Redis server clock, so clock skew between application hosts does not affect reaping.
+
+Because any process sharing the Redis key prefix can reap an orphaned batch, the reaping process must be able to resolve the job's worker class by name. If it cannot (for example, during a rolling deploy where only new processes define a new worker class), the job is kept in Redis and retried on later flushes so a process that does define the class can enqueue it. After `max_enqueue_attempts` failed attempts (also counting jobs that repeatedly raise errors when enqueued), the job's payload is moved to the dead list at `<prefix>:dead`, where it expires after the `orphan_ttl`. If two independent applications share one Redis, give each application its own `redis_key_prefix`.
+
+Because deferred jobs are serialized by class name, anonymous worker classes cannot be deferred and will raise an `ArgumentError`.
 
 When Sidekiq is running in a testing mode (`Sidekiq::Testing.fake!` or `Sidekiq::Testing.inline!`), deferred jobs are held in memory instead of Redis, so your test suite does not need a running Redis just to use this gem.
 
 ### Configuration
 
 ```ruby
-# Seconds before an unflushed batch is treated as orphaned and eligible to be reaped
-# by another process. Default: 300.
+# Seconds of inactivity before an unflushed batch is treated as orphaned and eligible
+# to be reaped by another process. Default: 300.
 Sidekiq::DeferredJobs.grace_period = 300
 
 # Redis key prefix used for all keys created by this gem. Default: "sidekiq-deferred_jobs".
@@ -128,6 +134,10 @@ Sidekiq::DeferredJobs.max_orphans_per_flush = 100
 # Backstop TTL (in seconds) applied to batch keys so batches that are never reaped still
 # expire from Redis. Default: 86400 (24 hours).
 Sidekiq::DeferredJobs.orphan_ttl = 86_400
+
+# Number of times a reaped job that cannot be enqueued is retried on later flushes
+# before its payload is moved to the dead list. Default: 5.
+Sidekiq::DeferredJobs.max_enqueue_attempts = 5
 ```
 
 ## Limitations
@@ -135,6 +145,8 @@ Sidekiq::DeferredJobs.orphan_ttl = 86_400
 - Only jobs enqueued with `perform_async` are deferred. Jobs enqueued through other mechanisms (`perform_bulk`, `Sidekiq::Client.push`, or ActiveJob with the Sidekiq adapter) are not intercepted and will be enqueued immediately.
 
 - The list of deferred jobs is scoped to the current thread and fiber. Jobs enqueued from other threads or fibers spawned inside a `defer_jobs` block (including code using lazy enumerators or async frameworks that switch fibers) will not be deferred.
+
+- The Lua scripts used by the Redis persistence derive key names at runtime, so this gem is not compatible with Redis Cluster (Sidekiq itself does not support Redis Cluster either).
 
 Note that if you are running with a relational database you may want to use another mechanism to work with transactional data (i.e. the `after_commit` hook in ActiveRecord). However, if you have a single logical operation that contains multiple transactions, this mechanism could be a good fit. For example, if you have a complex business operation that updates multiple rows and calls external services, you may not want a single transaction since it could lock database rows for a long period creating performance problems. This gem could be used to orchestrate transactional logic for Sidekiq workers in systems with native transaction support.
 

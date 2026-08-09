@@ -8,8 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Deferred jobs are now persisted to Redis while they are deferred, so they are not lost if a process crashes or is killed inside a `defer_jobs` block. When a block is flushed, its jobs are atomically popped from Redis and any orphaned jobs left behind by a dead process are reaped and enqueued as well, using a single Lua script that guarantees each job is enqueued exactly once. When Sidekiq is running in a testing mode, deferred jobs continue to be held in memory.
-- Added configuration options `Sidekiq::DeferredJobs.grace_period`, `.redis_key_prefix`, `.max_orphans_per_flush`, and `.orphan_ttl`.
+- Deferred jobs are now persisted to Redis while they are deferred, so they are not lost if a process crashes or is killed inside a `defer_jobs` block. When a block is flushed, its jobs are atomically moved to an in-flight list in Redis and each job is removed only after it has been handed to Sidekiq, so a crash at any point during the flush cannot lose a job (delivery is at least once). Orphaned jobs left behind by a dead process are reaped and enqueued by a later flush in any process. When Sidekiq is running in a testing mode, deferred jobs continue to be held in memory.
+- Reaped jobs that cannot be enqueued (for example, when the worker class is not defined in the reaping process, or enqueuing repeatedly raises an error) are retried on later flushes instead of being dropped, and are moved to a dead list in Redis after too many failed attempts. An error enqueuing a reaped orphan job is contained and cannot break the flush of the block that reaped it.
+- Added configuration options `Sidekiq::DeferredJobs.grace_period`, `.redis_key_prefix`, `.max_orphans_per_flush`, `.orphan_ttl`, and `.max_enqueue_attempts`.
 
 ## 1.0.2
 

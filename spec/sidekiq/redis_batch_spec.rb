@@ -21,6 +21,7 @@ RSpec.describe Sidekiq::DeferredJobs::RedisBatch do
   after do
     Sidekiq::DeferredJobs.grace_period = nil
     Sidekiq::DeferredJobs.max_orphans_per_flush = nil
+    Sidekiq::DeferredJobs.max_enqueue_attempts = nil
     flush_redis!
   end
 
@@ -54,6 +55,14 @@ RSpec.describe Sidekiq::DeferredJobs::RedisBatch do
     redis_cmd("LRANGE", "#{prefix}:batch:#{id}", 0, -1)
   end
 
+  def dead_payloads
+    redis_cmd("LRANGE", "#{prefix}:dead", 0, -1)
+  end
+
+  def total_deferred_payloads
+    redis_cmd("KEYS", "#{prefix}:batch:*").sum { |key| redis_cmd("LLEN", key) }
+  end
+
   def seed_batch(id, jobs, score:)
     jobs.each do |klass, args, opts|
       payload = JSON.generate("class" => klass.to_s, "args" => args, "opts" => opts)
@@ -64,6 +73,17 @@ RSpec.describe Sidekiq::DeferredJobs::RedisBatch do
 
   def now_ms
     (Time.now.to_f * 1000).to_i
+  end
+
+  # Simulate a flush happening in another process: a fresh batch with no jobs of its own
+  # still reaps any batch that is past the grace period.
+  def flush_from_another_process!
+    Sidekiq::DeferredJobs.undeferred { Sidekiq::DeferredJobs::RedisBatch.new.enqueue! }
+  end
+
+  # Backdate a batch's registry score so it looks idle for longer than the grace period.
+  def make_idle(id)
+    redis_cmd("ZADD", registry, now_ms - 10_000, id)
   end
 
   # --- durability ----------------------------------------------------------
@@ -100,6 +120,36 @@ RSpec.describe Sidekiq::DeferredJobs::RedisBatch do
       job = Sidekiq::Queue.new("high").first
       expect(job.args).to eq ["a", 1]
       expect(job["foo"]).to eq "bazzle"
+    end
+
+    it "keeps each job in Redis until it has been handed to Sidekiq" do
+      counts_at_push_time = []
+      allow(TestWorker).to receive(:client_push).and_wrap_original do |original, *args|
+        counts_at_push_time << total_deferred_payloads
+        original.call(*args)
+      end
+
+      Sidekiq.defer_jobs do
+        TestWorker.perform_async(1)
+        TestWorker.perform_async(2)
+      end
+
+      # Each job is popped from Redis only after it is handed to Sidekiq, so a crash
+      # at any point cannot lose a job.
+      expect(counts_at_push_time).to eq [2, 1]
+      expect(deferred_keys).to eq []
+      expect(enqueued_args("high")).to eq [[1], [2]]
+    end
+
+    it "raises an ArgumentError when deferring a job for an anonymous worker class" do
+      anonymous_worker = Class.new do
+        include(defined?(Sidekiq::Job) ? Sidekiq::Job : Sidekiq::Worker)
+      end
+
+      Sidekiq.defer_jobs do
+        expect { anonymous_worker.perform_async(1) }.to raise_error(ArgumentError, /anonymous/)
+      end
+      expect(deferred_keys).to eq []
     end
   end
 
@@ -153,6 +203,110 @@ RSpec.describe Sidekiq::DeferredJobs::RedisBatch do
 
       expect(enqueued_args("high").size).to eq 2 # current + one orphan
       expect(registry_ids.size).to eq 1 # one orphan left for a later flush
+    end
+
+    it "does not let a failing reaped job break the flush that reaped it" do
+      seed_batch("orphan-1", [[UniqueWorker, [7], nil]], score: now_ms - 10_000)
+      Sidekiq::DeferredJobs.grace_period = 1
+      allow(UniqueWorker).to receive(:client_push).and_raise("Boom!")
+
+      expect {
+        Sidekiq.defer_jobs { TestWorker.perform_async(1) }
+      }.not_to raise_error
+
+      expect(enqueued_args("high")).to eq [[1]]
+      # The failed job is retained in Redis for a later attempt.
+      expect(registry_ids.size).to eq 1
+      retained = batch_payloads(registry_ids.first)
+      expect(retained.size).to eq 1
+      expect(JSON.parse(retained.first)["attempts"]).to eq 1
+    end
+
+    it "retries a reaped job whose worker class is not defined, then moves it to the dead list" do
+      seed_batch("orphan-1", [["NoSuchWorkerClass", [7], nil]], score: now_ms - 10_000)
+      Sidekiq::DeferredJobs.grace_period = 1
+      Sidekiq::DeferredJobs.max_enqueue_attempts = 2
+
+      Sidekiq.defer_jobs { TestWorker.perform_async(1) }
+
+      # First attempt: the job is retained so a process that has the class can retry it.
+      expect(registry_ids.size).to eq 1
+      retained = batch_payloads(registry_ids.first)
+      expect(retained.size).to eq 1
+      expect(JSON.parse(retained.first)["attempts"]).to eq 1
+      expect(dead_payloads).to eq []
+
+      # Second attempt reaches the limit and the job is moved to the dead list.
+      redis_cmd("ZADD", registry, now_ms - 10_000, registry_ids.first)
+      Sidekiq.defer_jobs { TestWorker.perform_async(2) }
+
+      expect(registry_ids).to eq []
+      expect(dead_payloads.size).to eq 1
+      expect(JSON.parse(dead_payloads.first)["class"]).to eq "NoSuchWorkerClass"
+    end
+
+    it "does not re-enqueue jobs that were reaped while the block was still open" do
+      Sidekiq::DeferredJobs.grace_period = 1
+
+      Sidekiq.defer_jobs do
+        TestWorker.perform_async(1)
+        TestWorker.perform_async(2)
+        make_idle(registry_ids.first)
+
+        # Another process reaps the idle batch and enqueues its jobs early.
+        flush_from_another_process!
+        expect(enqueued_args("high")).to eq [[1], [2]]
+        expect(registry_ids).to eq []
+      end
+
+      # The block's own flush finds an empty batch, so the jobs are not enqueued twice.
+      expect(enqueued_args("high")).to eq [[1], [2]]
+      expect(deferred_keys).to eq []
+    end
+
+    it "still defers jobs added after its batch was reaped" do
+      Sidekiq::DeferredJobs.grace_period = 1
+
+      Sidekiq.defer_jobs do
+        TestWorker.perform_async(1)
+        make_idle(registry_ids.first)
+        flush_from_another_process!
+
+        TestWorker.perform_async(2)
+        # The batch is registered again so the new job is durable and still deferred.
+        expect(registry_ids.size).to eq 1
+        expect(enqueued_args("high")).to eq [[1]]
+      end
+
+      expect(enqueued_args("high")).to eq [[1], [2]]
+      expect(deferred_keys).to eq []
+    end
+
+    it "cannot abort jobs that were already reaped and enqueued by another process" do
+      Sidekiq::DeferredJobs.grace_period = 1
+
+      Sidekiq.defer_jobs do
+        TestWorker.perform_async(1)
+        make_idle(registry_ids.first)
+        flush_from_another_process!
+
+        # The jobs are already enqueued, so there is nothing left to abort.
+        expect(Sidekiq.abort_deferred_jobs!).to eq []
+      end
+
+      expect(enqueued_args("high")).to eq [[1]]
+    end
+
+    it "moves unparseable payloads to the dead list instead of dropping them" do
+      redis_cmd("RPUSH", "#{prefix}:batch:orphan-1", "not json")
+      redis_cmd("ZADD", registry, now_ms - 10_000, "orphan-1")
+      Sidekiq::DeferredJobs.grace_period = 1
+
+      Sidekiq.defer_jobs { TestWorker.perform_async(1) }
+
+      expect(enqueued_args("high")).to eq [[1]]
+      expect(dead_payloads).to eq ["not json"]
+      expect(registry_ids).to eq []
     end
   end
 
@@ -221,6 +375,35 @@ RSpec.describe Sidekiq::DeferredJobs::RedisBatch do
       end
       expect(enqueued_args("high")).to eq []
       expect(enqueued_args("low")).to eq [[2]]
+    end
+
+    it "does not restore jobs that another process drained between the read and the rewrite" do
+      Sidekiq.defer_jobs do
+        TestWorker.perform_async(1)
+        UniqueWorker.perform_async(2)
+
+        batch = Thread.current[:sidekiq_deferred_jobs_jobs][0]
+        id = registry_ids.first
+        drained = false
+        allow(batch).to receive(:read).and_wrap_original do |original|
+          pairs = original.call
+          unless drained
+            drained = true
+            # Simulate another process reaping and enqueuing the batch after the read.
+            redis_cmd("DEL", "#{prefix}:batch:#{id}")
+            redis_cmd("ZREM", registry, id)
+          end
+          pairs
+        end
+
+        # The stale first read fails the compare-and-swap; the retry sees the batch is
+        # gone and nothing is written back to Redis to be enqueued a second time.
+        expect(Sidekiq.abort_deferred_jobs!(TestWorker)).to eq []
+        expect(deferred_keys).to eq []
+      end
+
+      expect(enqueued_args("high")).to eq []
+      expect(enqueued_args("low")).to eq []
     end
   end
 
