@@ -18,16 +18,24 @@ end
 
 appraise "sidekiq_6.x" do
   gem "sidekiq", "~> 6.0"
+  gem "base64"
+  gem "logger"
 end
 
 appraise "sidekiq_6.0" do
   gem "sidekiq", "~> 6.0.0"
+  gem "base64"
+  gem "logger"
 end
 
 appraise "sidekiq_5.x" do
   gem "sidekiq", "~> 5.0"
+  gem "base64"
+  gem "logger"
 end
 
 appraise "sidekiq_5.0" do
   gem "sidekiq", "~> 5.0.0"
+  gem "base64"
+  gem "logger"
 end
