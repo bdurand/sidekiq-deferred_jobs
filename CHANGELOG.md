@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- Deferred jobs are now persisted to Redis while they are deferred, so they are not lost if a process crashes or is killed inside a `defer_jobs` block. When a block is flushed, its jobs are atomically popped from Redis and any orphaned jobs left behind by a dead process are reaped and enqueued as well, using a single Lua script that guarantees each job is enqueued exactly once. When Sidekiq is running in a testing mode, deferred jobs continue to be held in memory.
+- Added configuration options `Sidekiq::DeferredJobs.grace_period`, `.redis_key_prefix`, `.max_orphans_per_flush`, and `.orphan_ttl`.
+
 ## 1.0.2
 
 ### Fixed

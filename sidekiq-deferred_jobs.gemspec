@@ -24,6 +24,7 @@ Gem::Specification.new do |spec|
     Gemfile.lock
     Rakefile
     bin/
+    docker-compose.yml
     gemfiles/
     spec/
   ]

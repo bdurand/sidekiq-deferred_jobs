@@ -18,10 +18,21 @@ env:
   BUNDLE_JOBS: 3
   BUNDLE_RETRY: 3
   RUBYOPT: '--enable=frozen-string-literal --debug=frozen-string-literal'
+  REDIS_URL: redis://localhost:6379/0
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: valkey/valkey:8
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     strategy:
       fail-fast: false
       matrix:
