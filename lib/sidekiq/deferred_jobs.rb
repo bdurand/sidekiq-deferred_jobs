@@ -84,7 +84,7 @@ module Sidekiq
       # @api private
       def scheduled_opts?(opts)
         return false unless opts
-        !!(opts["at"] || opts[:at])
+        !!(opts["at"] || opts[:at] || opts["wait"] || opts[:wait] || opts["wait_until"] || opts[:wait_until])
       end
     end
 
