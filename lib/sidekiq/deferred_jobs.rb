@@ -4,16 +4,24 @@ require "set"
 require "sidekiq"
 
 module Sidekiq
+  # Adds the ability to defer enqueuing Sidekiq jobs until the end of a block of code.
+  # See Sidekiq::DeferredJobs::DeferBlock for the methods that are added to `Sidekiq`
+  # itself (`Sidekiq.defer_jobs`, `Sidekiq.abort_deferred_jobs!`, and
+  # `Sidekiq.enqueue_deferred_jobs!`).
   module DeferredJobs
     class << self
       # Defer enqueuing Sidekiq workers within the block until the end of the block.
       # Any workers that normally would have been enqueued with a `perform_async` call
       # will instead be queued up and run in an ensure clause at the end of the block.
       #
+      # Blocks can be nested. Deferred jobs are only enqueued at the end of the outermost
+      # block and the filters from all of the enclosing blocks apply, so a job is deferred
+      # if it matches the filter on any block it is nested inside of.
+      #
       # @param filter [Array<Module>, Array<Hash>] An array of either classes, modules, or hashes.
       #        If this is provided, only workers that match either a class or module or which have
-      #        sidekiq_options that match a hash will be deferred. All other worker will be enqueued as normal.
-      # @return [void]
+      #        sidekiq_options that match a hash will be deferred. All other workers will be enqueued as normal.
+      # @return [Object] the return value of the block
       def defer(filter, &block)
         new_filter = Filter.new(filter)
         jobs, filters = Thread.current[:sidekiq_deferred_jobs_jobs]
@@ -35,9 +43,10 @@ module Sidekiq
       end
 
       # Disable deferred workers within the block. All workers will be enqueued normally
-      # within the block.
+      # within the block. Any jobs already deferred by an enclosing block are left alone
+      # and will still be enqueued when that block exits.
       #
-      # @return [void]
+      # @return [Object] the return value of the block
       def undeferred(&block)
         save_val = Thread.current[:sidekiq_deferred_jobs_jobs]
         begin
@@ -51,15 +60,16 @@ module Sidekiq
       # Return true if the specified class with optional options should be deferred.
       #
       # @param klass [Class] A Sidekiq worker class
-      # @param opts [Hash, Nil] Optionsl options set at runtime for the worker.
-      # @return Boolean
+      # @param opts [Hash, Nil] Optional options set at runtime for the worker.
+      # @return [Boolean]
       def defer?(klass, opts = nil)
         _jobs, filters = Thread.current[:sidekiq_deferred_jobs_jobs]
         return false if filters.nil?
         filters.any? { |filter| filter.match?(klass, opts) }
       end
 
-      # Schedule a worker to be run at the end of the outermost defer block.
+      # Schedule a worker to be enqueued at the end of the outermost defer block.
+      # If there is no defer block in progress, the worker is enqueued immediately.
       #
       # @param klass [Class] Sidekiq worker class
       # @param args [Array] Sidekiq job arguments
@@ -88,6 +98,7 @@ module Sidekiq
       end
     end
 
+    # Methods added to the `Sidekiq` module itself for controlling deferred jobs.
     module DeferBlock
       # Defer enqueuing Sidekiq workers within the block until the end of the block.
       # Any workers that normally would have been enqueued with a `perform_async` call
@@ -95,10 +106,12 @@ module Sidekiq
       #
       # @param filter [Array<Module>, Hash, false] Optional filter on which workers should be deferred.
       #                If a filter is specified, only matching workers will be deferred. To match the
-      #                filter, the worker must either be the class specfied or include the module or
-      #                have sidekiq_options that match the specified hash. If the filter is `false`
-      #                then job deferral will be disabled entirely within the block.
-      # @return [void]
+      #                filter, the worker must either be the class specified (or a subclass of it),
+      #                include the module, or have sidekiq_options that match the specified hash.
+      #                Multiple filters can be specified and a worker will be deferred if it matches
+      #                any of them. If the filter is `false` then job deferral will be disabled
+      #                entirely within the block.
+      # @return [Object] the return value of the block
       def defer_jobs(*filter, &block)
         if filter.size == 1 && filter.first == false
           Sidekiq::DeferredJobs.undeferred(&block)
@@ -107,10 +120,12 @@ module Sidekiq
         end
       end
 
-      # Abort any already deferred Sidkiq workers in the current `defer_job` block.
+      # Abort any already deferred Sidekiq workers in the current `defer_jobs` block.
       # If a filter is specified, then only matching Sidekiq jobs will be aborted.
+      # Does nothing if called outside of a `defer_jobs` block.
       #
-      # @param filter [Array<Module>, Hash, false] See #defer_job for filter specification.
+      # @param filter [Array<Module>, Hash] See #defer_jobs for filter specification.
+      #                Unlike #defer_jobs, `false` is not a valid filter here.
       # @return [Array<Sidekiq::DeferredJobs::Job>] the jobs that were aborted
       def abort_deferred_jobs!(*filter)
         jobs, _filters = Thread.current[:sidekiq_deferred_jobs_jobs]
@@ -121,10 +136,12 @@ module Sidekiq
         end
       end
 
-      # Immediately enqueue any already deferred Sidkiq workers in the current `defer_job` block.
+      # Immediately enqueue any already deferred Sidekiq workers in the current `defer_jobs` block.
       # If a filter is specified, then only matching Sidekiq jobs will be enqueued.
+      # Does nothing if called outside of a `defer_jobs` block.
       #
-      # @param filter [Array<Module>, Hash, false] See #defer_job for filter specification.
+      # @param filter [Array<Module>, Hash] See #defer_jobs for filter specification.
+      #                Unlike #defer_jobs, `false` is not a valid filter here.
       # @return [void]
       def enqueue_deferred_jobs!(*filter)
         jobs, _filters = Thread.current[:sidekiq_deferred_jobs_jobs]
@@ -137,6 +154,8 @@ module Sidekiq
 
     # Override logic for Sidekiq::Worker.
     module DeferredWorker
+      # @return [Object] the job id if the job was enqueued. If the job was deferred, the
+      #         return value is unspecified since no job id exists until the job is enqueued.
       def perform_async(*args)
         if Sidekiq::DeferredJobs.defer?(self)
           Sidekiq::DeferredJobs.defer_worker(self, args)
@@ -148,6 +167,8 @@ module Sidekiq
 
     # Override logic for Sidekiq::Worker::Setter.
     module DeferredSetter
+      # @return [Object] the job id if the job was enqueued. If the job was deferred, the
+      #         return value is unspecified since no job id exists until the job is enqueued.
       def perform_async(*args)
         if !Sidekiq::DeferredJobs.scheduled_opts?(@opts) && Sidekiq::DeferredJobs.defer?(@klass, @opts)
           Sidekiq::DeferredJobs.defer_worker(@klass, args, @opts)
@@ -213,11 +234,15 @@ module Sidekiq
 
       # Enqueue any deferred jobs that match the filter.
       #
+      # If a worker declares a uniqueness constraint (either with Sidekiq Enterprise or the
+      # sidekiq-unique-jobs gem), then duplicate jobs with the same class, arguments, and queue
+      # are collapsed into a single job within this call.
+      #
       # If enqueuing a job raises an error, the error will be propagated to the caller
       # and any jobs that have not yet been enqueued will be retained in the deferred
       # job list so they are not silently lost and can be enqueued again.
       #
-      # @param filters [Array<Module>, Array<Hash>] Filter for jobs to clear
+      # @param filters [Array<Module>, Array<Hash>] Filter for jobs to enqueue
       # @return [void]
       def enqueue!(filters = nil)
         filter = Filter.new(filters)
@@ -253,7 +278,7 @@ module Sidekiq
 
       private
 
-      # @return [Boolean] true if the worker support a uniqueness constraint
+      # @return [Boolean] true if the worker declares a uniqueness constraint
       def unique_job?(klass, opts)
         enterprise_option = worker_options(klass, opts)["unique_for"] if defined?(Sidekiq::Enterprise)
         unique_jobs_option = worker_options(klass, opts)["lock"] if defined?(SidekiqUniqueJobs)
