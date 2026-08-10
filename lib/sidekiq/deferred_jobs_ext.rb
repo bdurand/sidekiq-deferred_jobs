@@ -6,7 +6,10 @@
 
 Sidekiq.extend(Sidekiq::DeferredJobs::DeferBlock)
 
-if defined?(Sidekiq::Job)
+# Sidekiq::Job is the job mixin on Sidekiq 6.3+, but older versions define an
+# unrelated Sidekiq::Job class in sidekiq/api.rb, so check for the mixin's
+# ClassMethods constant rather than just the presence of the Sidekiq::Job constant.
+if defined?(Sidekiq::Job) && Sidekiq::Job.const_defined?(:ClassMethods)
   Sidekiq::Job::ClassMethods.prepend(Sidekiq::DeferredJobs::DeferredWorker)
   Sidekiq::Job::Setter.prepend(Sidekiq::DeferredJobs::DeferredSetter)
 else

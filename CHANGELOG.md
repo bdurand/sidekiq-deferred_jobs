@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Deferred jobs that have not yet been enqueued are no longer silently dropped if an error is raised while enqueuing jobs. The error is still raised to the calling code, but the remaining jobs are retained so `Sidekiq.enqueue_deferred_jobs!` can be safely retried.
 - Duplicate unique jobs are no longer suppressed if they are enqueued to different queues.
 - Runtime options are no longer lost when a job is passed through `Sidekiq::DeferredJobs.defer_worker` outside of a defer block.
+- Fixed a `NameError` on application boot with Sidekiq 5.0 through 6.2 when `sidekiq/api` was loaded before this gem. Those versions define an unrelated `Sidekiq::Job` class in the API which was mistaken for the `Sidekiq::Job` mixin added in Sidekiq 6.3.
+- Jobs enqueued with `set(sync: true)` are no longer deferred; they run inline at the call site as Sidekiq intends.
+- A hash filter passed directly to `Sidekiq::DeferredJobs.defer` is now applied as a `sidekiq_options` filter. Previously it silently matched all jobs.
 
 ### Changed
 

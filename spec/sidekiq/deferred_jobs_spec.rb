@@ -72,6 +72,26 @@ RSpec.describe Sidekiq::DeferredJobs do
       expect(TestWorker.jobs.size).to eq 2
     end
 
+    it "should not defer jobs enqueued with the sync option" do
+      Sidekiq.defer_jobs do
+        expect(Sidekiq::DeferredJobs.defer?(TestWorker, {"sync" => true})).to eq false
+        expect(Sidekiq::DeferredJobs.defer?(TestWorker, {sync: true})).to eq false
+        expect(Sidekiq::DeferredJobs.defer?(TestWorker)).to eq true
+      end
+    end
+
+    it "should accept a bare hash as a filter" do
+      filter = Sidekiq::DeferredJobs::Filter.new("queue" => "high")
+      expect(filter.match?(TestWorker)).to eq true
+      expect(filter.match?(UniqueWorker)).to eq false
+    end
+
+    it "should retain runtime options when defer_worker is called outside of a defer block" do
+      Sidekiq::DeferredJobs.defer_worker(TestWorker, [1], "foo" => "bazzle")
+      expect(TestWorker.jobs.collect { |job| job["args"] }).to eq [[1]]
+      expect(TestWorker.jobs.collect { |job| job["foo"] }).to eq ["bazzle"]
+    end
+
     it "should raise an ArgumentError on invalid filters" do
       expect { Sidekiq.defer_jobs("high") { TestWorker.perform_async(1) } }.to raise_error(ArgumentError)
       expect(TestWorker.jobs.size).to eq 0
@@ -169,6 +189,26 @@ RSpec.describe Sidekiq::DeferredJobs do
       end
       expect(TestWorker.jobs.size).to eq 2
       expect(UniqueWorker.jobs.size).to eq 1
+    end
+
+    it "should not enqueue duplicate unique jobs again when retrying after an error" do
+      stub_const("SidekiqUniqueJobs", Module.new)
+      Sidekiq.defer_jobs do
+        UniqueJobsWorker.perform_async(1)
+        TestWorker.perform_async(2)
+        UniqueJobsWorker.perform_async(1)
+
+        allow(TestWorker).to receive(:client_push).and_raise("Boom!")
+        expect { Sidekiq.enqueue_deferred_jobs! }.to raise_error("Boom!")
+        expect(UniqueJobsWorker.jobs.size).to eq 1
+
+        allow(TestWorker).to receive(:client_push).and_call_original
+        Sidekiq.enqueue_deferred_jobs!
+        expect(UniqueJobsWorker.jobs.size).to eq 1
+        expect(TestWorker.jobs.size).to eq 1
+      end
+      expect(UniqueJobsWorker.jobs.size).to eq 1
+      expect(TestWorker.jobs.size).to eq 1
     end
 
     it "should filter jobs to immediately enqueue" do

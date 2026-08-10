@@ -58,11 +58,13 @@ module Sidekiq
       end
 
       # Return true if the specified class with optional options should be deferred.
+      # Jobs scheduled to run in the future and jobs that run inline are never deferred.
       #
       # @param klass [Class] A Sidekiq worker class
       # @param opts [Hash, Nil] Optional options set at runtime for the worker.
       # @return [Boolean]
       def defer?(klass, opts = nil)
+        return false if scheduled_opts?(opts) || inline_opts?(opts)
         _jobs, filters = Thread.current[:sidekiq_deferred_jobs_jobs]
         return false if filters.nil?
         filters.any? { |filter| filter.match?(klass, opts) }
@@ -79,10 +81,8 @@ module Sidekiq
         jobs, _filters = Thread.current[:sidekiq_deferred_jobs_jobs]
         if jobs
           jobs.defer(klass, args, opts)
-        elsif opts
-          klass.set(opts).perform_async(*args)
         else
-          klass.perform_async(*args)
+          enqueue_job(klass, args, opts)
         end
       end
 
@@ -94,7 +94,47 @@ module Sidekiq
       # @api private
       def scheduled_opts?(opts)
         return false unless opts
-        !!(opts["at"] || opts[:at] || opts["wait"] || opts[:wait] || opts["wait_until"] || opts[:wait_until])
+        !!(opts["at"] || opts[:at])
+      end
+
+      # Return true if the options indicate a job that runs inline at the call site
+      # rather than being pushed to a queue. Inline jobs are never deferred.
+      #
+      # @param opts [Hash, Nil] Runtime options set for a job.
+      # @return [Boolean]
+      # @api private
+      def inline_opts?(opts)
+        return false unless opts
+        opts["sync"] == true || opts[:sync] == true
+      end
+
+      # Enqueue a job through the normal Sidekiq mechanism.
+      #
+      # @param klass [Class] Sidekiq worker class
+      # @param args [Array] Sidekiq job arguments
+      # @param opts [Hash, Nil] Optional runtime options for the job
+      # @return [Object] the value returned by `perform_async`
+      # @api private
+      def enqueue_job(klass, args, opts = nil)
+        if opts
+          klass.set(opts).perform_async(*args)
+        else
+          klass.perform_async(*args)
+        end
+      end
+
+      # Merge runtime options with the worker class sidekiq_options.
+      #
+      # @param klass [Class] Sidekiq worker class
+      # @param opts [Hash, Nil] Optional runtime options for the job
+      # @return [Hash] the merged options with string keys
+      # @api private
+      def worker_options(klass, opts = nil)
+        if opts
+          klass.sidekiq_options.merge(opts.transform_keys(&:to_s))
+        else
+          klass.sidekiq_options
+        end
       end
     end
 
@@ -170,7 +210,7 @@ module Sidekiq
       # @return [Object] the job id if the job was enqueued. If the job was deferred, the
       #         return value is unspecified since no job id exists until the job is enqueued.
       def perform_async(*args)
-        if !Sidekiq::DeferredJobs.scheduled_opts?(@opts) && Sidekiq::DeferredJobs.defer?(@klass, @opts)
+        if Sidekiq::DeferredJobs.defer?(@klass, @opts)
           Sidekiq::DeferredJobs.defer_worker(@klass, args, @opts)
         else
           super
@@ -181,7 +221,7 @@ module Sidekiq
     # Logic for filtering jobs by worker class and/or sidekiq_options.
     class Filter
       def initialize(filters)
-        @filters = Array(filters).flatten
+        @filters = (filters.is_a?(Hash) ? [filters] : Array(filters).flatten)
         invalid = @filters.reject { |filter| filter.is_a?(Module) || filter.is_a?(Hash) }
         unless invalid.empty?
           raise ArgumentError, "Filters must be classes, modules, or hashes; got #{invalid.collect(&:inspect).join(", ")}"
@@ -195,7 +235,7 @@ module Sidekiq
           if filter.is_a?(Module)
             klass <= filter
           else
-            worker_options = (opts ? klass.sidekiq_options.merge(opts.transform_keys(&:to_s)) : klass.sidekiq_options)
+            worker_options = Sidekiq::DeferredJobs.worker_options(klass, opts)
             filter.all? { |key, value| worker_options[key.to_s] == value }
           end
         end
@@ -209,6 +249,7 @@ module Sidekiq
     class Jobs
       def initialize
         @jobs = []
+        @dedup_keys = Set.new
       end
 
       # Add a job to the deferred job list.
@@ -240,7 +281,9 @@ module Sidekiq
       #
       # If enqueuing a job raises an error, the error will be propagated to the caller
       # and any jobs that have not yet been enqueued will be retained in the deferred
-      # job list so they are not silently lost and can be enqueued again.
+      # job list so they are not silently lost and can be enqueued again. The keys of
+      # unique jobs that were already enqueued are remembered until a call completes
+      # without an error so that retrying does not enqueue duplicates.
       #
       # @param filters [Array<Module>, Array<Hash>] Filter for jobs to enqueue
       # @return [void]
@@ -249,23 +292,16 @@ module Sidekiq
         unmatched_jobs = []
         pending_jobs = @jobs
         begin
-          duplicates = Set.new
           until pending_jobs.empty?
             job = pending_jobs.first
             if filter.match?(job.klass, job.opts)
-              suppress = false
-              if unique_job?(job.klass, job.opts)
-                dedup_key = [job.klass, job.args, worker_options(job.klass, job.opts)["queue"]]
-                suppress = duplicates.include?(dedup_key)
-                duplicates << dedup_key
+              options = Sidekiq::DeferredJobs.worker_options(job.klass, job.opts)
+              dedup_key = nil
+              dedup_key = [job.klass, job.args, options["queue"]] if unique_job?(options)
+              unless dedup_key && @dedup_keys.include?(dedup_key)
+                Sidekiq::DeferredJobs.enqueue_job(job.klass, job.args, job.opts)
               end
-              unless suppress
-                if job.opts
-                  job.klass.set(job.opts).perform_async(*job.args)
-                else
-                  job.klass.perform_async(*job.args)
-                end
-              end
+              @dedup_keys << dedup_key if dedup_key
             else
               unmatched_jobs << job
             end
@@ -273,15 +309,16 @@ module Sidekiq
           end
         ensure
           @jobs = unmatched_jobs + pending_jobs
+          @dedup_keys.clear if pending_jobs.empty?
         end
       end
 
       private
 
-      # @return [Boolean] true if the worker declares a uniqueness constraint
-      def unique_job?(klass, opts)
-        enterprise_option = worker_options(klass, opts)["unique_for"] if defined?(Sidekiq::Enterprise)
-        unique_jobs_option = worker_options(klass, opts)["lock"] if defined?(SidekiqUniqueJobs)
+      # @return [Boolean] true if the options declare a uniqueness constraint
+      def unique_job?(options)
+        enterprise_option = options["unique_for"] if defined?(Sidekiq::Enterprise)
+        unique_jobs_option = options["lock"] if defined?(SidekiqUniqueJobs)
 
         if enterprise_option
           true
@@ -289,15 +326,6 @@ module Sidekiq
           unique_jobs_option.to_s != "while_executing"
         else
           false
-        end
-      end
-
-      # Merge runtime options with the worker class sidekiq_options.
-      def worker_options(klass, opts)
-        if opts
-          klass.sidekiq_options.merge(opts.transform_keys(&:to_s))
-        else
-          klass.sidekiq_options
         end
       end
     end
